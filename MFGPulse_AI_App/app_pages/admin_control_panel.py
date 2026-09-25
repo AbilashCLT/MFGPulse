@@ -5,6 +5,11 @@ from app_pages._shared import DB, get_conn, fmt_currency, load_notification_sett
 
 alt.renderers.enable("mimetype")
 
+persona = st.session_state.get("persona", "TECHNICIAN")
+if persona not in ("APP_ADMIN", "PLANT_MANAGER"):
+    st.warning("Access restricted — Admin Panel is available to Plant Manager and Application Admin only.")
+    st.stop()
+
 conn = get_conn()
 
 # ─── Helpers (matching all other pages) ───

@@ -6,27 +6,26 @@ import altair as alt
 from datetime import datetime
 from app_pages._shared import (
     load_executive_summary, load_predictions, load_live_predictions,
-    load_cost_by_asset, load_alerts, load_oee_by_line, load_oee_loss,
+    load_alerts, load_oee_by_line, load_oee_loss,
     load_open_work_orders, load_maintenance_logs, load_procurement_recs,
     load_open_pos, PERSONA_CONFIG, DB, C, get_conn,
 )
 
 alt.renderers.enable("mimetype")
-conn = get_conn()
-
-exe = load_executive_summary()
-preds = load_predictions()
-live = load_live_predictions()
-cost_asset = load_cost_by_asset()
-alerts = load_alerts()
-oee = load_oee_by_line()
-loss = load_oee_loss()
-wos = load_open_work_orders()
-maint_logs = load_maintenance_logs()
-e = exe.iloc[0] if len(exe) > 0 else {}
 
 @st.cache_data(ttl=300)
 def build_plant_context():
+    conn = get_conn()
+    exe = load_executive_summary()
+    preds = load_predictions()
+    live = load_live_predictions()
+    alerts = load_alerts()
+    oee = load_oee_by_line()
+    loss = load_oee_loss()
+    wos = load_open_work_orders()
+    maint_logs = load_maintenance_logs()
+    e = exe.iloc[0] if len(exe) > 0 else {}
+
     sections = []
     sections.append("=== EXECUTIVE SUMMARY ===")
     sections.append(f"Plant OEE: {e.get('PLANT_OEE', 0)}% (target: 85%). Critical assets: {e.get('CRITICAL_ASSETS', 0)}/{e.get('TOTAL_ASSETS', 10)}. Cost avoided: ${int(e.get('TOTAL_COST_AVOIDED', 0)):,}. Maintenance ROI: {e.get('MAINTENANCE_ROI_X', 0)}x. Early detection: {int(e.get('AVG_EARLY_DETECTION_DAYS', 0))} days avg.")
@@ -50,8 +49,6 @@ def build_plant_context():
         open_p = load_open_pos()
         sections.append(f"Open POs: {len(open_p)}")
     return "\n".join(sections)
-
-PLANT_CONTEXT = build_plant_context()
 
 AGENT_KEYWORDS = ["generate work order", "create work order", "file work order", "run diagnosis", "7-model", "predict_all", "full diagnosis", "simulate", "what-if", "what if", "monte carlo"]
 
@@ -120,7 +117,7 @@ def resolve_asset_reference(question):
 
     sql = _RANKING_SQL[matched_key]
     try:
-        session = conn.session()
+        session = get_conn().session()
         result = session.sql(sql).collect()
         if not result:
             return question, None
@@ -144,8 +141,8 @@ def fast_llm_answer(question, role_context):
 RULES: Use exact numbers. For at-risk assets always state "Repair cost $X vs Failure cost $Y — Cost of inaction: $Z". RUL < 24h = URGENT prefix. Use markdown headers, bold, bullet points. If the question is general or conversational, respond naturally without forcing data into the answer.
 QUESTION: {question}
 DATA:
-{PLANT_CONTEXT}"""
-    session = conn.session()
+{build_plant_context()}"""
+    session = get_conn().session()
     try:
         result = session.sql("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS R", params=[system_prompt]).collect()
     except Exception as ex:
@@ -156,7 +153,7 @@ def call_agent(question, role_context):
     contextualized_q = f"[Speaking as a {role_context}] {question}"
     request_body = json.dumps({"messages": [{"role": "user", "content": [{"type": "text", "text": contextualized_q}]}]})
     try:
-        session = conn.session()
+        session = get_conn().session()
         result = session.sql(
             f"SELECT SNOWFLAKE.CORTEX.DATA_AGENT_RUN('{DB}.AGENT.MAINTENANCE_COPILOT', ?) AS RESPONSE",
             params=[request_body],
@@ -239,22 +236,24 @@ with st.expander("About this page", expanded=False, icon=":material/info:"):
 
 **Two response paths**:
 - **Fast path** — Data questions (OEE, costs, status) answered from pre-loaded plant context via Cortex Complete. Faster, no tool calls.
-- **Agent path** — Complex tasks routed to the 5-tool Cortex Agent. Triggers: "diagnosis", "simulate", "work order", "history", "root cause".
+- **Agent path** — Complex tasks routed to the 7-tool Cortex Agent. Triggers: "diagnosis", "simulate", "work order", "purchase order", "history", "root cause".
 
-**5 Agent tools**:
+**7 Agent tools**:
 | Tool | Trigger keywords | What it does |
 |---|---|---|
-| maintenance_analytics | OEE, trend, how many | Text-to-SQL via Semantic View (17 VQRs) |
-| maintenance_history | history, repairs, root cause | RAG search over 26 maintenance docs |
-| predict_all | diagnosis, 7-model, full diagnosis | Runs all 7 ML models on one asset |
+| maintenance_analytics | OEE, trend, how many | Text-to-SQL via Semantic View (19 VQRs) |
+| maintenance_history | history, repairs, root cause | RAG search over maintenance log documents |
+| diagnose_asset | diagnose, check asset | Fast M1-M4 diagnosis (failure mode, RUL, degradation, fatigue) |
+| deep_analysis | full diagnosis, 7-model, root cause | LLM-powered M5-M7 (root cause, simulation, prescription) |
 | simulate_scenario | simulate, what-if, monte carlo | 100-path Monte Carlo simulation |
 | generate_work_order | create WO, generate work order | Creates and files a work order |
+| generate_purchase_order | order parts, create PO, procure | Creates a purchase order with supplier resolution |
 
 **Sections**:
 - **Suggested questions** — Persona-specific quick-action pills (e.g., technicians see diagnostic prompts, managers see cost prompts)
 - **Chat interface** — Full conversational UI with message history, role-specific avatars, and loading status indicators
 - **Sidebar: New session** — Start a fresh conversation, archiving the current one
-- **Sidebar: Tools** — Lists the 5 available tools: Semantic View, Cortex Search, PREDICT_ALL, Simulator, Work Orders
+- **Sidebar: Tools** — Lists the 7 available tools: Semantic View, Cortex Search, Diagnose Asset, Deep Analysis, Simulator, Work Orders, Purchase Orders
 - **Sidebar: Session history** — Browse and restore previous chat sessions with title, timestamp, and message count
 
 **Tips**: Be specific with asset IDs ("ASSET_005") or names ("Compressor A1"). The Copilot adapts response format to your persona — technicians get step-by-step actions, managers get cost summaries.

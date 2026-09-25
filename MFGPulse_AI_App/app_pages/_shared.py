@@ -373,6 +373,15 @@ def clear_all_caches():
     load_planned_pos.clear()
     load_latest_sensor_readings.clear()
     load_fatigue_trend.clear()
+    load_data_freshness.clear()
+    load_kpi_snapshots.clear()
+    load_oee_period_comparison.clear()
+    load_alert_history.clear()
+    load_drift_metrics.clear()
+    load_drift_comparison.clear()
+    load_model_accuracy.clear()
+    load_feedback_log.clear()
+    load_active_reservations.clear()
 
 # --- Feature: Data Freshness SLA ---
 @st.cache_data(ttl=60)

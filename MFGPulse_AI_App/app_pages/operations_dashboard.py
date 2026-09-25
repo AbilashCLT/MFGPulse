@@ -840,6 +840,8 @@ with tab_sensor:
                 "TEMPERATURE": {"warn": 100.0, "crit": 270.0},
                 "CURRENT_AMPS": {"warn": 20.0, "crit": 23.0},
                 "ACOUSTIC_DB": {"warn": 85.0, "crit": 90.0},
+                "RPM": {"warn": 1800.0, "crit": 2000.0},
+                "PRESSURE": {"warn": 8.0, "crit": 10.0},
             }
 
             with st.container(horizontal=True):
@@ -878,8 +880,8 @@ with tab_sensor:
             if breaches:
                 st.warning("Threshold breaches detected: " + " | ".join(breaches))
 
-            channels = ["VIB_MAG", "TEMPERATURE", "RPM", "CURRENT_AMPS"]
-            channel_labels = {"VIB_MAG": "Vibration (mm/s)", "TEMPERATURE": "Temperature (°C)", "RPM": "RPM", "CURRENT_AMPS": "Current (A)"}
+                channels = ["VIB_MAG", "TEMPERATURE", "RPM", "CURRENT_AMPS", "ACOUSTIC_DB", "PRESSURE"]
+                channel_labels = {"VIB_MAG": "Vibration (mm/s)", "TEMPERATURE": "Temperature (°C)", "RPM": "RPM", "CURRENT_AMPS": "Current (A)", "ACOUSTIC_DB": "Acoustic (dB)", "PRESSURE": "Pressure (bar)"}
             sel_channel = st.selectbox("Channel", channels, format_func=lambda x: channel_labels.get(x, x), key="sensor_ch")
 
             with st.container(border=True):

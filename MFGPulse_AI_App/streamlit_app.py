@@ -195,9 +195,9 @@ if st.session_state.persona is None:
         with st.container(border=True):
             st.html("""
             <div style="text-align:center;">
-                <div style="color:#10B981; font-size:1.4rem; font-weight:800;">5</div>
+                <div style="color:#10B981; font-size:1.4rem; font-weight:800;">7</div>
                 <div style="color:#10B981; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.08em; font-weight:600;">AI Copilot tools</div>
-                <div style="color:#64748B; font-size:0.68rem; margin-top:4px;">Analytics, search, diagnosis, simulation, work orders</div>
+                <div style="color:#64748B; font-size:0.68rem; margin-top:4px;">Analytics, search, diagnosis, deep analysis, simulation, work orders, purchase orders</div>
             </div>
             """)
 
