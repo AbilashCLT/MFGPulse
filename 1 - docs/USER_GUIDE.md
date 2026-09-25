@@ -483,7 +483,7 @@ The Copilot uses two different AI paths depending on your question:
 
 **Fast Path (Data Questions)** — For questions about plant metrics, asset status, OEE, etc. Uses pre-loaded plant data + Cortex Complete (llama3.1-70b) for immediate answers. You'll see "Retrieving plant data..." in the status indicator.
 
-**Agent Path (Complex Tasks)** — For diagnostics, simulations, work orders, and maintenance history searches. Routes to the 5-tool Cortex Agent. You'll see "Searching maintenance history..." or "Running ML models..." depending on the tool being used.
+**Agent Path (Complex Tasks)** — For diagnostics, simulations, work orders, purchase orders, and maintenance history searches. Routes to the 7-tool Cortex Agent. You'll see "Searching maintenance history..." or "Running ML models..." depending on the tool being used.
 
 ### Agent Trigger Keywords
 
@@ -676,12 +676,14 @@ It's the estimated financial impact if a predicted failure is ignored: `failure_
 **Q: How do I run the test suite?**
 Admin Panel → Test Suite → Select a category → Run Tests. The acceptance threshold is >= 95% pass rate. Tests run directly against MFGPULSE_DB and verify data integrity, ML pipeline outputs, procurement logic, and more.
 
-**Q: What are the 5 Copilot Agent tools?**
+**Q: What are the 7 Copilot Agent tools?**
 1. **maintenance_analytics** — Text-to-SQL via Semantic View (OEE, costs, trends)
 2. **maintenance_history** — RAG search over 78 maintenance log documents
-3. **predict_all** — Full 7-model diagnosis for any asset
-4. **simulate_scenario** — Monte Carlo what-if simulation
-5. **generate_work_order** — Create and file a work order
+3. **diagnose_asset** — Fast M1-M4 diagnosis (failure mode, RUL, degradation, fatigue)
+4. **deep_analysis** — LLM-powered M5-M7 (root cause, Monte Carlo simulation, prescriptive recommendation)
+5. **simulate_scenario** — Monte Carlo what-if simulation with adjustable parameters
+6. **generate_work_order** — Create and file a work order with auto-assigned technician and parts reservation
+7. **generate_purchase_order** — Create a purchase order with supplier resolution, lead time, and risk classification
 
 **Q: Who receives notifications?**
 Each event type has configurable target personas. By default, WO events (including reassign and follow-up) go to Shift Supervisor, Plant Manager, and App Admin. PO events go to Procurement Admin, Plant Manager, and App Admin. Admins can change this in Admin Panel → Notifications.

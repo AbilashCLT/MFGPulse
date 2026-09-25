@@ -9,7 +9,7 @@ The **MFGPulse AI Command Center** is a predictive maintenance and OEE (Overall 
 
 The name "Failure Genome" reflects the idea that every machine failure has a unique DNA — a combination of sensor signatures, degradation trajectories, fatigue patterns, and operational context that can be decoded to predict and prevent breakdowns.
 
-The platform includes role-based dashboards for 6 personas, a Cortex AI agent with 5 tools, a procurement-to-maintenance closed loop with PO lifecycle management, an email/in-app notification system, and an integrated test suite — all running natively on Snowflake.
+The platform includes role-based dashboards for 6 personas, a Cortex AI agent with 7 tools, a procurement-to-maintenance closed loop with PO lifecycle management, an email/in-app notification system, and an integrated test suite — all running natively on Snowflake.
 
 ---
 
@@ -72,7 +72,7 @@ The platform includes role-based dashboards for 6 personas, a Cortex AI agent wi
 │                                                                     │
 │  ┌─── AGENT ──────────────────────────┐                            │
 │  │ MAINTENANCE_SEMANTIC_VIEW (21 VQRs)│  ← Cortex Agent layer     │
-│  │ MAINTENANCE_COPILOT (5-tool agent) │                            │
+│  │ MAINTENANCE_COPILOT (7-tool agent) │                            │
 │  └────────────────────────────────────┘                            │
 └─────────────────────────────────────────────────────────────────────┘
            │
@@ -105,7 +105,7 @@ The platform includes role-based dashboards for 6 personas, a Cortex AI agent wi
 | **Fleet Comparison** | Z-score of an asset's vibration relative to the fleet mean — identifies outliers ("worst in fleet"). |
 | **ATP** | Available-to-Promise = `quantity_on_hand - reserved_quantity`. How many parts are actually available. |
 | **Procurement Risk** | 4-level classification: `NO_RISK` / `ORDER_NOW` / `EXPEDITE` / `CRITICAL_SHORTAGE`. |
-| **Cortex Agent** | An LLM-powered assistant with 5 tools: analytics (text-to-SQL), search (RAG), prediction, simulation, and work order generation. |
+| **Cortex Agent** | An LLM-powered assistant with 7 tools: analytics (text-to-SQL), search (RAG), fast diagnosis (M1-M4), deep analysis (M5-M7), simulation, work order generation, and purchase order generation. |
 | **Dynamic Table** | A Snowflake object that auto-refreshes its contents based on upstream changes — the backbone of the feature engineering pipeline. |
 | **Cortex Search** | A RAG (Retrieval-Augmented Generation) service indexing maintenance logs for natural-language search. |
 | **Persona** | A user role that determines page access: `TECHNICIAN`, `RELIABILITY_ENGINEER`, `SHIFT_SUPERVISOR`, `PLANT_MANAGER`, `PROCUREMENT_ADMIN`, `APP_ADMIN`. |
@@ -362,22 +362,24 @@ RUL overrides the composite degradation score — per the P-F interval model, an
 - **Suggested question pills** per persona (click to ask).
 - **Dual LLM paths**:
   - **Fast path**: Data questions answered from pre-loaded plant context via `CORTEX.COMPLETE`.
-  - **Agent path**: Complex tasks triggering the 5-tool Cortex Agent.
+  - **Agent path**: Complex tasks triggering the 7-tool Cortex Agent.
 - **Status indicators**: "Retrieving plant data..." / "Searching maintenance history..." / "Running ML models..." while processing.
 - **Session history**: New session button, previous sessions listed in sidebar, click to restore.
 - **Greeting detection**: "hi/hello" gets a short friendly response, not a data dump.
 
-**The 5 Agent Tools**:
+**The 7 Agent Tools**:
 
 | Tool | What It Does | Example Question |
 |---|---|---|
 | `maintenance_analytics` | Text-to-SQL via Semantic View | "What's the OEE for Line 1?" |
 | `maintenance_history` | RAG search over 78 maintenance logs | "What repairs were done on Compressor A1?" |
-| `predict_all` | Full M1-M7 diagnosis for one asset | "Run a full diagnosis on ASSET_005" |
+| `diagnose_asset` | Fast M1-M4 diagnosis (failure mode, RUL, degradation, fatigue) | "Diagnose ASSET_005" |
+| `deep_analysis` | LLM-powered M5-M7 (root cause, simulation, prescription) | "Run a full diagnosis on ASSET_005" |
 | `simulate_scenario` | Monte Carlo what-if simulation | "What if we reduce load on ASSET_001 by 30%?" |
 | `generate_work_order` | Create and file a work order | "Create a preventive WO for Fan F1" |
+| `generate_purchase_order` | Create a purchase order for parts | "Order parts needed for Pump P2 repair" |
 
-**Agent trigger keywords**: "generate work order", "create work order", "run diagnosis", "7-model", "full diagnosis", "simulate", "what-if", "monte carlo".
+**Agent trigger keywords**: "generate work order", "create work order", "run diagnosis", "7-model", "full diagnosis", "simulate", "what-if", "monte carlo", "order parts", "create PO".
 
 ---
 
@@ -579,6 +581,7 @@ DAG_CONVERT_PPOS                   → Auto-convert overdue PPOs to actual POs
 | TC-06: Simulation | 4 | Healthy=0%, load reduction effects, CI ordering |
 | TC-07: Copilot/Search | 2+ | Asset coverage, Cortex Search accuracy benchmarks |
 | TC-08: Persona Access | 11 | Page access matrix, admin restriction |
+| TC-11: ML Edge Cases | 10+ | UDF boundary inputs, nulls, zeros, extreme values |
 
 Acceptance: >= 95% pass rate across all categories.
 
@@ -589,14 +592,14 @@ Acceptance: >= 95% pass rate across all categories.
 | Path | Purpose |
 |---|---|
 | `MFGPulse_AI_App/streamlit_app.py` | Main entry point — persona login, navigation, notification bell |
-| `MFGPulse_AI_App/app_pages/*.py` | 9 Streamlit pages (see Section 6) |
+| `MFGPulse_AI_App/app_pages/*.py` | 8 Streamlit page modules (see Section 6) |
 | `MFGPulse_AI_App/snowflake.yml` | Deployment manifest |
-| `sql/01-20_*.sql` | Modular DDL + seed data scripts |
-| `sql/deploy_one_time_consolidated.sql` | Master deployment script (phases 1-14) |
-| `sql/ddl_objects.sql` | Executable UDF + procedure DDL for cross-instance deployment |
-| `test_cases/test_*.sql` + `.py` | 10 test suite files (see Section 12) |
+| `0 - Setup/scripts/deploy_one_time_consolidated.sql` | Master deployment script (14 checkpoints, all DDL + seed data) |
+| `0 - Setup/scripts/*.sql` | Operational helper scripts (share, sync, emergency stop) |
+| `0 - Setup/DEPLOYMENT_GUIDE.md` | Full deployment walkthrough + cross-instance instructions |
+| `test_cases/test_*.sql` + `.py` | 9 test suite files (see Section 12) |
 | `cortex_project/` | Cortex Agent + Semantic View YAML definitions |
-| `docs/` | README, Technical Guide, User Guide, Test Cases Guide, Full DDL |
+| `1 - docs/` | Technical Guide, User Guide, Process Flow |
 
 ---
 

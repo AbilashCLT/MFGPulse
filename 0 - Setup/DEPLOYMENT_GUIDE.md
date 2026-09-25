@@ -6,17 +6,13 @@
 
 ## Recommended: One-Time Deployment Script
 
-For the fastest, most reliable deployment, use:
+For the fastest, most reliable deployment, use the consolidated script:
 
 ```
-sql/deploy_one_time_consolidated.sql    — Orchestration script with 14 checkpoints, timing, and credit logging
-sql/deployment_report.sql  — Post-deployment report (run after deploy_one_time.sql)
-sql/credit_consumption_report.sql — Credit usage analysis and monthly cost projections (run after deploy_one_time_consolidated.sql)
+0 - Setup/scripts/deploy_one_time_consolidated.sql
 ```
 
-`deploy_one_time_consolidated.sql` creates a `DEPLOYMENT_LOG` table that tracks each phase with start/end time, credits consumed, objects created, and pass/fail validation. After completion, run `deployment_report.sql` for a full health check.
-
-> **Note on stub scripts**: Scripts 07, 08, 09, 10, 12, 16 (before this update), and 17 were description-only stubs with no executable DDL. The actual DDL lives in `docs/full_ddl_export.sql`. The `deploy_one_time_consolidated.sql` script references the correct source files for each phase. Script `16_procurement_views.sql` now contains complete executable DDL for all 5 procurement views.
+This single, fully self-contained script creates everything from zero: 1 database, 7 schemas, 2 warehouses, 23+ tables, 13 dynamic tables, 30+ views, 5 UDFs, 21+ procedures, 10 DAG tasks, 1 Cortex Search service, and all seed data (~175K+ rows). It includes a `DEPLOYMENT_LOG` table that tracks each phase with start/end time, credits consumed, objects created, and pass/fail validation. Run top-to-bottom in Snowsight with ACCOUNTADMIN role.
 
 ---
 
@@ -36,18 +32,20 @@ sql/credit_consumption_report.sql — Credit usage analysis and monthly cost pro
 
 ## Deployment Overview
 
+All phases below are handled by `0 - Setup/scripts/deploy_one_time_consolidated.sql` except Phases 12-13 (Cortex Agent and Streamlit).
+
 ```
-Phase 1: Infrastructure     (Script 01)          ~5 seconds
-Phase 2: Base tables         (Scripts 02-03)      ~5 seconds
-Phase 3: Seed data           (Scripts 04-06)      ~2 minutes
-Phase 4: Dynamic tables      (Scripts 07-09)      ~3 minutes (DT initial refresh)
-Phase 5: ML models           (Scripts 10-11)      ~1 minute
-Phase 6: Analytics           (Script 12)          ~1 minute (DT initial refresh)
-Phase 7: Cortex Search       (Script 13)          ~30 seconds
-Phase 8: Automation          (Script 14)          ~5 seconds
-Phase 9: Procurement         (Scripts 15-17)      ~30 seconds
-Phase 10: Validation         (Script 18)          ~10 seconds
-Phase 11: Notifications      (Script 19)          ~10 seconds
+Phase 1: Infrastructure     (Checkpoint 1)       ~5 seconds
+Phase 2: Base tables         (Checkpoint 2)       ~5 seconds
+Phase 3: Seed data           (Checkpoints 3-4)    ~2 minutes
+Phase 4: Dynamic tables      (Checkpoints 5-6)    ~3 minutes (DT initial refresh)
+Phase 5: ML models           (Checkpoints 7-8)    ~1 minute
+Phase 6: Analytics           (Checkpoint 9)       ~1 minute (DT initial refresh)
+Phase 7: Cortex Search       (Checkpoint 10)      ~30 seconds
+Phase 8: Automation          (Checkpoint 11)      ~5 seconds
+Phase 9: Procurement         (Checkpoint 12)      ~30 seconds
+Phase 10: Validation         (Checkpoint 13)      ~10 seconds
+Phase 11: Notifications      (Checkpoint 14)      ~10 seconds
 Phase 12: Cortex Agent       (Manual deploy)      ~2 minutes
 Phase 13: Streamlit app      (Open in Snowsight)  ~1 minute
                                                   ──────────
@@ -56,13 +54,15 @@ Phase 13: Streamlit app      (Open in Snowsight)  ~1 minute
 
 ---
 
-## Step-by-Step Deployment
+## Step-by-Step Phase Reference
+
+> The phases below describe what each section of `deploy_one_time_consolidated.sql` creates. Run the consolidated script top-to-bottom — these are reference descriptions, not separate scripts to execute individually.
 
 ### Phase 1 — Infrastructure
 
 Open a SQL worksheet in Snowsight. Set role to `ACCOUNTADMIN`.
 
-Run `sql/01_infrastructure.sql`:
+The consolidated script creates:
 
 ```sql
 -- Creates: MFGPULSE_DB, 7 schemas, COMPUTE_WH, MFGPULSE_CREDIT_GUARD, MFGPULSE_AUTOMATION_WH, MFGPULSE_AUTOMATION_GUARD
@@ -80,7 +80,7 @@ SHOW SCHEMAS IN DATABASE MFGPULSE_DB;
 
 ### Phase 2 — Base Tables & Streams
 
-Run `sql/02_base_tables.sql`:
+Creates 19 base tables across RAW_OT and RAW_IT:
 ```sql
 -- Creates 19 base tables across RAW_OT and RAW_IT
 -- Tables: ASSET_MASTER, SENSOR_METADATA, SENSOR_READINGS, AMBIENT_CONDITIONS,
@@ -90,7 +90,7 @@ Run `sql/02_base_tables.sql`:
 --         FATIGUE_SCORES, ANOMALY_SCORES
 ```
 
-Run `sql/03_streams.sql`:
+Creates 3 CDC streams:
 ```sql
 -- Creates 3 CDC streams:
 --   SENSOR_READINGS_STREAM, MAINTENANCE_LOGS_STREAM, WORK_ORDERS_STREAM
@@ -109,7 +109,7 @@ GROUP BY TABLE_SCHEMA;
 
 ### Phase 3 — Seed Data
 
-Run `sql/04_seed_data.sql`:
+Populates reference data:
 ```sql
 -- Populates reference data:
 --   10 assets, 23 sensors, 15 parts, 9 users (6 personas),
@@ -118,14 +118,13 @@ Run `sql/04_seed_data.sql`:
 --   10 model registry entries
 ```
 
-Run `sql/05_generate_sensor_data.sql`:
+Generates synthetic sensor data:
 ```sql
 -- Generates 172K+ sensor readings (30-day history, 15-min intervals, 10 assets)
 -- This is the largest data generation step — may take 1-2 minutes
 ```
 
-**Do NOT run `sql/06_fatigue_scores.sql` here** — it depends on UDFs and Dynamic Tables
-created in later phases. It runs in Phase 5 after ML models are deployed.
+**Note**: Fatigue scoring depends on UDFs and Dynamic Tables created in later phases — the consolidated script handles this ordering automatically.
 
 **Verify:**
 ```sql
@@ -141,7 +140,7 @@ FROM MFGPULSE_DB.ML_MODELS.FATIGUE_SCORES;
 
 ### Phase 4 — Dynamic Tables (Feature Engineering)
 
-Run `sql/07_curated_dynamic_tables.sql`:
+Creates 3 curated dynamic tables:
 ```sql
 -- Creates 3 curated DTs:
 --   SENSOR_WITH_CONTEXT (172K rows) — OT sensors + IT metadata joined
@@ -150,7 +149,7 @@ Run `sql/07_curated_dynamic_tables.sql`:
 -- All with TARGET_LAG = '1 hour', WAREHOUSE = COMPUTE_WH
 ```
 
-Run `sql/08_ml_feature_dynamic_tables.sql`:
+Creates 7 feature engineering dynamic tables:
 ```sql
 -- Creates 7 feature engineering DTs:
 --   LABELED_DATA, ROLLING_STATS, SENSOR_INTERACTIONS,
@@ -159,7 +158,7 @@ Run `sql/08_ml_feature_dynamic_tables.sql`:
 -- Wait for initial refresh to complete (~2-3 minutes)
 ```
 
-Run `sql/09_ml_feature_views.sql`:
+Creates 11 ML feature views:
 ```sql
 -- Creates 11 ML feature views (used for model training)
 ```
@@ -179,7 +178,7 @@ LIMIT 15;
 
 ### Phase 5 — ML Models & Predictions
 
-Run `sql/10_udfs_live_predictions.sql`:
+Creates UDFs and prediction pipeline:
 ```sql
 -- Creates 5 UDFs:
 --   PREDICT_FAILURE_MODE (M1), PREDICT_RUL (M2),
@@ -190,7 +189,7 @@ Run `sql/10_udfs_live_predictions.sql`:
 -- Creates LIVE_PREDICTIONS dynamic table (calls M1-M3 UDFs on refresh)
 ```
 
-Run `sql/11_native_ml_models.sql` (optional but recommended):
+Trains 4 Snowflake-native ML models (optional but recommended):
 ```sql
 -- Trains 4 Snowflake-native ML models using corrected training views.
 -- IMPORTANT: Training views were fixed on 2026-09-13:
@@ -201,7 +200,6 @@ Run `sql/11_native_ml_models.sql` (optional but recommended):
 --   MODEL_ACCURACY_LIVE view, COMPUTE_NATIVE_PREDICTIONS proc,
 --   RETRAIN_IF_NEEDED proc, LOG_FEEDBACK proc, DAG_CHECK_DRIFT task
 -- Note: Training may take 10-20 minutes and consume ~0.5-2 credits
--- For initial setup or retraining, use sql/retrain_and_validate.sql
 ```
 
 **Verify:**
@@ -216,7 +214,7 @@ ORDER BY RUL_HOURS ASC;
 
 ### Phase 6 — Analytics Layer
 
-Run `sql/12_analytics_layer.sql`:
+Creates the analytics dynamic tables and views:
 ```sql
 -- Creates 2 dynamic tables:
 --   ACTIVE_ALERTS — Multi-signal alert engine (Critical/Warning/Watch/Info)
@@ -243,7 +241,7 @@ SELECT SEVERITY, COUNT(*) FROM MFGPULSE_DB.ANALYTICS.ACTIVE_ALERTS GROUP BY SEVE
 
 ### Phase 7 — Cortex Search
 
-Run `sql/13_cortex_search.sql`:
+Creates the Cortex Search service:
 ```sql
 -- Creates MAINTENANCE_SEARCH Cortex Search service
 -- Indexes 78 maintenance documents (log entries joined with asset + WO context)
@@ -260,7 +258,7 @@ SHOW CORTEX SEARCH SERVICES IN SCHEMA MFGPULSE_DB.ML_MODELS;
 
 ### Phase 8 — Automation Tasks
 
-Run `sql/14_automation.sql`:
+Creates the 10-task DAG (all SUSPENDED by default):
 ```sql
 -- Creates 3 scheduled tasks (all SUSPENDED by default):
 --   SIMULATE_SENSOR_FEED (every 720 min) — generates new sensor readings
@@ -269,32 +267,36 @@ Run `sql/14_automation.sql`:
 -- Resume tasks only when you want continuous data simulation
 ```
 
-> **Note**: The automation runs as a Task DAG. Resume children first (bottom-up), then root:
+> **Note**: The automation runs as a 10-task DAG. Resume children first (bottom-up), then root:
 > ```sql
+> ALTER TASK MFGPULSE_DB.ANALYTICS.DAG_SNAPSHOT_KPIS RESUME;
 > ALTER TASK MFGPULSE_DB.ANALYTICS.DAG_CONVERT_PPOS RESUME;
 > ALTER TASK MFGPULSE_DB.ANALYTICS.DAG_GENERATE_POS RESUME;
 > ALTER TASK MFGPULSE_DB.ANALYTICS.DAG_GENERATE_WOS RESUME;
+> ALTER TASK MFGPULSE_DB.ANALYTICS.DAG_CHECK_DRIFT RESUME;
+> ALTER TASK MFGPULSE_DB.ANALYTICS.DAG_ARCHIVE_ALERTS RESUME;
 > ALTER TASK MFGPULSE_DB.ANALYTICS.DAG_REFRESH_DTS RESUME;
 > ALTER TASK MFGPULSE_DB.ANALYTICS.DAG_REFRESH_FATIGUE RESUME;
+> ALTER TASK MFGPULSE_DB.ANALYTICS.DAG_CHECK_FRESHNESS RESUME;
 > ALTER TASK MFGPULSE_DB.ANALYTICS.MFGPULSE_AUTOMATION_DAG RESUME;
 > ```
-> This starts the full chain: sensor data → fatigue → DT refresh → WO gen → PO gen → PPO conversion (every 12h).
+> This starts the full 10-task chain: sensor data → freshness check ∥ fatigue → DT refresh → alert archive ∥ drift check ∥ WO gen → PO gen → PPO conversion → KPI snapshot (every 12h).
 
 ---
 
 ### Phase 9 — Procurement System
 
-Run `sql/15_procurement_tables.sql`:
+Creates procurement-specific table structures:
 ```sql
 -- Creates procurement-specific table structures (if not already created in 02)
 ```
 
-Run `sql/16_procurement_views.sql`:
+Creates ATP and procurement views:
 ```sql
 -- Creates: PARTS_AVAILABLE_TO_PROMISE, PROCUREMENT_RECOMMENDATIONS views
 ```
 
-Run `sql/17_procurement_procedures.sql`:
+Creates PO lifecycle procedures:
 ```sql
 -- Creates: AUTO_GENERATE_PURCHASE_ORDERS procedure
 ```
@@ -312,7 +314,7 @@ LIMIT 5;
 
 ### Phase 10 — Validation
 
-Run `sql/18_validation.sql`:
+The consolidated script runs a full verification suite:
 ```sql
 -- Runs full verification suite:
 --   1. Schema existence (7 schemas)
@@ -333,7 +335,7 @@ Run `sql/18_validation.sql`:
 
 ### Phase 11 — Notifications
 
-Run `sql/19_notifications.sql`:
+Creates the notification infrastructure:
 ```sql
 -- Creates: NOTIFICATION_SETTINGS table (16 event types, admin-configurable)
 -- Creates: APP_NOTIFICATIONS table (in-app notification store)
@@ -369,7 +371,7 @@ cortex agent-studio agent-deploy cortex_project/MAINTENANCE_COPILOT_agent.yaml
     - 6 tables, 21 VQRs
 3. Create a new Cortex Agent using `MAINTENANCE_COPILOT_agent.yaml`
    - Target: `MFGPULSE_DB.AGENT.MAINTENANCE_COPILOT`
-   - 5 tools: maintenance_analytics, maintenance_history, predict_all, simulate_scenario, generate_work_order
+   - 7 tools: maintenance_analytics, maintenance_history, diagnose_asset, deep_analysis, simulate_scenario, generate_work_order, generate_purchase_order
 
 **Verify:**
 ```sql
@@ -461,35 +463,24 @@ ORDER BY OBJECT;
 
 ---
 
-## Quick-Reference: Script Execution Order
+## Quick-Reference: Deployment Script
 
-Copy and paste this block into a SQL worksheet to run all scripts in sequence. Replace `@path/` with the actual stage path or run each file individually.
+Run the consolidated deployment script in a SQL worksheet:
 
 ```
-sql/01_infrastructure.sql       ← Database, schemas, warehouse, resource monitor
-sql/02_base_tables.sql          ← 19 base tables
-sql/03_streams.sql              ← 3 CDC streams
-sql/04_seed_data.sql            ← Reference data (assets, parts, users, WOs, logs)
-sql/05_generate_sensor_data.sql ← 172K sensor readings (longest step)
-sql/06_fatigue_scores.sql       ← Fatigue scores + anomaly scores
-sql/07_curated_dynamic_tables.sql ← 3 curated DTs (wait for refresh)
-sql/08_ml_feature_dynamic_tables.sql ← 7 feature DTs (wait for refresh)
-sql/09_ml_feature_views.sql     ← 11 ML feature views
-sql/10_udfs_live_predictions.sql ← 5 UDFs + 3 procedures + LIVE_PREDICTIONS DT
-sql/11_native_ml_models.sql     ← Optional: native ML model training
-sql/12_analytics_layer.sql      ← 2 DTs + 6 views + 6 procedures
-sql/13_cortex_search.sql        ← MAINTENANCE_SEARCH Cortex Search service
-sql/14_automation.sql           ← 3 scheduled tasks (suspended)
-sql/15_procurement_tables.sql   ← Procurement table structures
-sql/16_procurement_views.sql    ← ATP + procurement recommendation views
-sql/17_procurement_procedures.sql ← PO lifecycle procedures
-sql/ddl_objects.sql             ← UDFs, procedures, PLANNED_PURCHASE_ORDERS view, auto-convert task
-sql/18_validation.sql           ← Full verification suite
-sql/19_notifications.sql        ← Notification settings + email integration
-sql/20_configurable_simulation.sql ← Configurable simulation procedure + config table
+0 - Setup/scripts/deploy_one_time_consolidated.sql  ← All DDL + seed data (14 checkpoints)
 ```
 
-Then deploy Cortex Semantic View + Agent from `cortex_project/`, and launch Streamlit.
+Then deploy Cortex Semantic View + Agent from `cortex_project/`, and launch Streamlit from `MFGPulse_AI_App/`.
+
+Additional operational scripts in `0 - Setup/scripts/`:
+
+```
+Share_DB.sql                       ← Cross-account share & replication setup
+Copy Share & Git.sql               ← Copy shared DB into local writable MFGPULSE_DB
+Truncate and Sync Share.sql        ← Reload local tables from shared database
+emergency_stop_all_credits.sql     ← Emergency suspension of all resources
+```
 
 ---
 
@@ -507,10 +498,10 @@ Then deploy Cortex Semantic View + Agent from `cortex_project/`, and launch Stre
 | `OEE Trend chart empty` | OEE_METRICS DT hasn't refreshed | OEE Trend uses the same OEE_METRICS view — wait for DT refresh or run `ALTER DYNAMIC TABLE MFGPULSE_DB.ANALYTICS.OEE_METRICS REFRESH` |
 | `Supply Chain charts empty` | Procurement views have no at-risk items | If all assets are healthy, the risk distribution donut and lead time gap charts will not render — this is expected when PROCUREMENT_RECOMMENDATIONS shows only NO_RISK items |
 | `Sensor feed shows no data` | No sensor readings in the last 24 hours | Run `SELECT COUNT(*) FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS WHERE TIMESTAMP >= DATEADD('hour', -24, CURRENT_TIMESTAMP())` — if 0, resume the SIMULATE_SENSOR_FEED task or run the simulation from Admin Panel |
-| `Procurement views return empty` | Procurement tables/views created before seed data | Re-run `sql/16_procurement_views.sql` after confirming PARTS_INVENTORY and ASSET_MASTER are populated |
+| `Procurement views return empty` | Procurement tables/views created before seed data | Re-run the procurement views section of the consolidated script after confirming PARTS_INVENTORY and ASSET_MASTER are populated |
 | `DT refresh stuck in SCHEDULING` | Warehouse suspended or credits exhausted | `ALTER WAREHOUSE COMPUTE_WH RESUME` and check resource monitor: `SHOW RESOURCE MONITORS` |
 | `FinOps section shows "unavailable"` | Role lacks access to SNOWFLAKE.ACCOUNT_USAGE views | Grant access: `GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE <role>` or use ACCOUNTADMIN |
-| `AUTO_CONVERT_PLANNED_POS fails with invalid identifier` | Procedure uses inline `FOR rec IN (SELECT...) DO` pattern | Snowflake SQL scripting requires explicit `DECLARE CURSOR` + `OPEN` + `FOR rec IN cursor DO` with `:=` assignments for cursor fields. Redeploy from `sql/ddl_objects.sql` which uses the correct pattern. |
+| `AUTO_CONVERT_PLANNED_POS fails with invalid identifier` | Procedure uses inline `FOR rec IN (SELECT...) DO` pattern | Snowflake SQL scripting requires explicit `DECLARE CURSOR` + `OPEN` + `FOR rec IN cursor DO` with `:=` assignments for cursor fields. Redeploy from the relevant section in `deploy_one_time_consolidated.sql`. |
 | `WO part badge shows EXPEDITE on in_progress WO` | Reservation exists but badge reads from PROCUREMENT_RECOMMENDATIONS | Expected: badge shows "RESERVED" (green) when active reservation exists for the WO. If not, verify `PART_RESERVATIONS` table has active rows for the WO_ID. |
 
 ---
@@ -532,41 +523,22 @@ To deploy MFGPulse AI on a **different Snowflake account** (fresh instance):
 
 **1. Copy the project files** to the target Snowflake workspace or local machine.
 
-**2. Run infrastructure + base tables + seed data** (Phases 1-9 of `deploy_one_time_consolidated.sql`):
+**2. Run the consolidated deployment script** on the target instance:
 ```sql
 -- Run in a SQL worksheet on the TARGET instance with ACCOUNTADMIN:
--- Execute deploy_one_time_consolidated.sql from PHASE 1 through PHASE 9 (stop before Phase 10)
+-- Execute 0 - Setup/scripts/deploy_one_time_consolidated.sql top-to-bottom
+-- This creates all infrastructure, tables, DTs, views, procedures, UDFs, seed data, and tasks
 ```
 
-**3. Deploy UDFs, procedures, and key objects** using `sql/ddl_objects.sql`:
-```sql
--- This file contains actual CREATE OR REPLACE statements (not GET_DDL references)
--- for all 5 UDFs, 8 key procedures, and deployment notes.
--- Execute the entire file on the target instance.
-```
+**3. Deploy Cortex AI components**:
+- Deploy Semantic View and Agent from `cortex_project/` directory
 
-**4. Deploy Dynamic Tables and Views** — extract from the source instance:
-```sql
--- On the SOURCE instance, run each GET_DDL command from deploy_one_time_consolidated.sql Phase 10
--- Copy the returned DDL and execute on the TARGET instance
--- Order: Curated DTs → ML_FEATURES DTs → ML_FEATURES Views → LIVE_PREDICTIONS DT
---        → Analytics DTs → Analytics Views
-
--- Alternatively, use docs/full_ddl_export.sql which contains all DDL (3800+ lines)
-```
-
-**5. Deploy Cortex Search, Agent, and Semantic View** (Phases 13-14 of `deploy_one_time_consolidated.sql`):
-```sql
--- Cortex Search: use the CREATE CORTEX SEARCH SERVICE statement from deploy_one_time_consolidated.sql
--- Semantic View + Agent: deploy from cortex_project/ directory
-```
-
-**6. Deploy Streamlit app**:
+**4. Deploy Streamlit app**:
 - Copy `MFGPulse_AI_App/` to a Snowsight workspace on the target instance
 - Update `snowflake.yml` if compute pool or warehouse names differ
 - Click Run
 
-**7. Run validation**:
+**5. Run validation**:
 ```sql
 -- Execute the validation section from deploy_one_time_consolidated.sql (Phase 12)
 -- All STATUS columns should show PASS
@@ -576,9 +548,7 @@ To deploy MFGPulse AI on a **different Snowflake account** (fresh instance):
 
 | File | Purpose |
 |---|---|
-| `sql/deploy_one_time_consolidated.sql` | Master script — phases 1-9 are fully executable, phase 10 has GET_DDL references |
-| `sql/ddl_objects.sql` | **NEW** — Actual CREATE statements for UDFs, procedures, PLANNED_PURCHASE_ORDERS view, auto-convert task. Uses explicit CURSOR declarations (not inline FOR loops) for Snowflake SQL scripting compatibility. |
-| `docs/full_ddl_export.sql` | Complete DDL for all custom objects including Session-4 procurement engine (procedures, views, task) |
+| `0 - Setup/scripts/deploy_one_time_consolidated.sql` | Master deployment script — all DDL + seed data with 14 checkpoints |
 | `cortex_project/*.yaml` | Cortex Agent + Semantic View definitions |
 | `MFGPulse_AI_App/` | Streamlit app (copy entire directory) |
 | `test_cases/` | Validation scripts (run post-deployment) |
@@ -588,7 +558,7 @@ To deploy MFGPulse AI on a **different Snowflake account** (fresh instance):
 | Item | What to Change |
 |---|---|
 | `COMPUTE_WH` | If using a different warehouse name for interactive queries, update `deploy_one_time_consolidated.sql` and `snowflake.yml` |
-| `MFGPULSE_AUTOMATION_WH` | If using a different warehouse for background tasks/DTs, update `sql/14_automation.sql` and all DT DDL |
+| `MFGPULSE_AUTOMATION_WH` | If using a different warehouse for background tasks/DTs, update `deploy_one_time_consolidated.sql` (search for MFGPULSE_AUTOMATION_WH) |
 | `SYSTEM_COMPUTE_POOL_CPU` | If compute pool name differs, update `snowflake.yml` |
 | `MFGPULSE_EMAIL` | Email notification integration — create on target if email delivery is needed |
 | Cortex AI models | Ensure `llama3.1-70b` and `llama3.1-8b` are available in the target region |
@@ -614,7 +584,7 @@ DROP NOTIFICATION INTEGRATION IF EXISTS MFGPULSE_EMAIL;
 
 ## Cross-Account Replication
 
-To replicate MFGPULSE_DB (including all data) to another Snowflake account in the same organization, use `sql/replicate_to_target.sql`.
+To replicate MFGPULSE_DB (including all data) to another Snowflake account in the same organization, use the `Share_DB.sql` script in `0 - Setup/scripts/`.
 
 ### What replicates automatically
 - 40 base tables (with all data)
@@ -624,11 +594,11 @@ To replicate MFGPULSE_DB (including all data) to another Snowflake account in th
 ### What must be recreated on target
 | Object | Why | How |
 |---|---|---|
-| Snowflake.ML.Classification models (2) | ML models don't replicate | Retrain via `sql/retrain_and_validate.sql` |
-| Cortex Search Service (MAINTENANCE_SEARCH) | Cortex Search doesn't replicate | DDL in `sql/replicate_to_target.sql` Step 2e |
+| Snowflake.ML.Classification models (2) | ML models don't replicate | Retrain using the ML model training section of the consolidated script |
+| Cortex Search Service (MAINTENANCE_SEARCH) | Cortex Search doesn't replicate | Use the Cortex Search CREATE statement from the consolidated script |
 | Cortex Agent + Semantic View | Agents don't replicate | Redeploy from `cortex_project/` YAMLs |
-| Warehouses (COMPUTE_WH, MFGPULSE_AUTOMATION_WH) | Account-level objects | DDL in `sql/replicate_to_target.sql` Step 2b |
-| Resource monitors | Account-level objects | DDL in `sql/replicate_to_target.sql` Step 2c |
+| Warehouses (COMPUTE_WH, MFGPULSE_AUTOMATION_WH) | Account-level objects | Create manually on target |
+| Resource monitors | Account-level objects | Create manually on target |
 
 ### Steps
 1. **Source account**: Run Part 1 (enable replication, create replication group)
