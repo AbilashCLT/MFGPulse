@@ -1,0 +1,192 @@
+-- ============================================================================
+-- MFGPulse AI: Post-Deployment Report
+-- Run AFTER deploy_one_time.sql to generate a comprehensive deployment report.
+-- ============================================================================
+
+USE DATABASE MFGPULSE_DB;
+
+-- ============================================================================
+-- 1. CHECKPOINT TIMELINE
+-- ============================================================================
+SELECT
+    CHECKPOINT_ID                        AS CP,
+    CHECKPOINT_NAME                      AS PHASE,
+    TO_CHAR(STARTED_AT, 'HH24:MI:SS')   AS STARTED,
+    TO_CHAR(COMPLETED_AT, 'HH24:MI:SS') AS COMPLETED,
+    DURATION_SEC                         AS SECONDS,
+    ROUND(CREDITS_USED, 6)              AS CREDITS,
+    OBJECTS_CREATED                      AS OBJECTS,
+    VALIDATION                           AS STATUS,
+    DETAILS
+FROM MFGPULSE_DB.PUBLIC.DEPLOYMENT_LOG
+ORDER BY CHECKPOINT_ID;
+
+
+-- ============================================================================
+-- 2. DEPLOYMENT TOTALS
+-- ============================================================================
+SELECT
+    COUNT(*)                                                        AS TOTAL_CHECKPOINTS,
+    SUM(CASE WHEN VALIDATION = 'PASS' THEN 1 ELSE 0 END)          AS PASSED,
+    SUM(CASE WHEN VALIDATION = 'FAIL' THEN 1 ELSE 0 END)          AS FAILED,
+    SUM(CASE WHEN VALIDATION = 'SKIP' THEN 1 ELSE 0 END)          AS MANUAL_STEPS,
+    ROUND(SUM(DURATION_SEC), 1)                                     AS TOTAL_SECONDS,
+    ROUND(SUM(DURATION_SEC) / 60.0, 1)                              AS TOTAL_MINUTES,
+    ROUND(SUM(CREDITS_USED), 4)                                     AS TOTAL_CREDITS,
+    SUM(OBJECTS_CREATED)                                            AS TOTAL_OBJECTS_CREATED
+FROM MFGPULSE_DB.PUBLIC.DEPLOYMENT_LOG;
+
+
+-- ============================================================================
+-- 3. OBJECT INVENTORY
+-- ============================================================================
+SELECT 'Schemas'         AS CATEGORY, COUNT(*) AS COUNT FROM INFORMATION_SCHEMA.SCHEMATA
+    WHERE SCHEMA_NAME IN ('RAW_OT','RAW_IT','CURATED','ML_FEATURES','ML_MODELS','ANALYTICS','AGENT')
+UNION ALL
+SELECT 'Base Tables',     COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA','PUBLIC')
+UNION ALL
+SELECT 'Dynamic Tables',  COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_TYPE = 'DYNAMIC TABLE'
+UNION ALL
+SELECT 'Views',           COUNT(*) FROM INFORMATION_SCHEMA.VIEWS
+    WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA','PUBLIC')
+UNION ALL
+SELECT 'Procedures',      COUNT(*) FROM INFORMATION_SCHEMA.PROCEDURES
+    WHERE PROCEDURE_SCHEMA NOT IN ('INFORMATION_SCHEMA','PUBLIC')
+UNION ALL
+SELECT 'Functions (UDFs)', COUNT(*) FROM INFORMATION_SCHEMA.FUNCTIONS
+    WHERE FUNCTION_SCHEMA NOT IN ('INFORMATION_SCHEMA','PUBLIC')
+UNION ALL
+SELECT 'Streams',         COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_TYPE = 'STREAM'
+UNION ALL
+SELECT 'Tasks',           COUNT(*) FROM INFORMATION_SCHEMA.TASKS
+ORDER BY CATEGORY;
+
+
+-- ============================================================================
+-- 4. DATA INTEGRITY CHECK
+-- ============================================================================
+SELECT 'ASSET_MASTER'       AS TABLE_NAME, COUNT(*) AS ROWS, CASE WHEN COUNT(*) = 10    THEN 'PASS' ELSE 'FAIL' END AS STATUS FROM RAW_OT.ASSET_MASTER
+UNION ALL SELECT 'SENSOR_METADATA',    COUNT(*), CASE WHEN COUNT(*) = 23    THEN 'PASS' ELSE 'FAIL' END FROM RAW_OT.SENSOR_METADATA
+UNION ALL SELECT 'SENSOR_READINGS',    COUNT(*), CASE WHEN COUNT(*) > 170000 THEN 'PASS' ELSE 'FAIL' END FROM RAW_OT.SENSOR_READINGS
+UNION ALL SELECT 'USERS',             COUNT(*), CASE WHEN COUNT(*) >= 8     THEN 'PASS' ELSE 'FAIL' END FROM RAW_IT.USERS
+UNION ALL SELECT 'PARTS_INVENTORY',    COUNT(*), CASE WHEN COUNT(*) = 15    THEN 'PASS' ELSE 'FAIL' END FROM RAW_IT.PARTS_INVENTORY
+UNION ALL SELECT 'MODEL_REGISTRY',     COUNT(*), CASE WHEN COUNT(*) = 12    THEN 'PASS' ELSE 'FAIL' END FROM ML_MODELS.MODEL_REGISTRY
+UNION ALL SELECT 'WORK_ORDERS',        COUNT(*), CASE WHEN COUNT(*) >= 22   THEN 'PASS' ELSE 'FAIL' END FROM RAW_IT.WORK_ORDERS
+UNION ALL SELECT 'MAINTENANCE_LOGS',   COUNT(*), CASE WHEN COUNT(*) >= 26   THEN 'PASS' ELSE 'FAIL' END FROM RAW_IT.MAINTENANCE_LOGS
+UNION ALL SELECT 'SHIFT_SCHEDULE',     COUNT(*), CASE WHEN COUNT(*) > 1500  THEN 'PASS' ELSE 'FAIL' END FROM RAW_IT.SHIFT_SCHEDULE
+UNION ALL SELECT 'PRODUCTION_OUTPUT',  COUNT(*), CASE WHEN COUNT(*) > 2500  THEN 'PASS' ELSE 'FAIL' END FROM RAW_IT.PRODUCTION_OUTPUT
+UNION ALL SELECT 'SUPPLIERS',          COUNT(*), CASE WHEN COUNT(*) = 5     THEN 'PASS' ELSE 'FAIL' END FROM RAW_IT.SUPPLIERS
+UNION ALL SELECT 'PART_SUPPLIERS',     COUNT(*), CASE WHEN COUNT(*) = 16    THEN 'PASS' ELSE 'FAIL' END FROM RAW_IT.PART_SUPPLIERS
+UNION ALL SELECT 'LIVE_PREDICTIONS',   COUNT(*), CASE WHEN COUNT(*) = 10    THEN 'PASS' ELSE 'FAIL' END FROM ML_MODELS.LIVE_PREDICTIONS
+UNION ALL SELECT 'FATIGUE_SCORES',     COUNT(*), CASE WHEN COUNT(*) > 0     THEN 'PASS' ELSE 'FAIL' END FROM ML_MODELS.FATIGUE_SCORES
+UNION ALL SELECT 'ACTIVE_ALERTS',      COUNT(*), CASE WHEN COUNT(*) > 0     THEN 'PASS' ELSE 'FAIL' END FROM ANALYTICS.ACTIVE_ALERTS
+UNION ALL SELECT 'OEE_METRICS',        COUNT(*), CASE WHEN COUNT(*) > 0     THEN 'PASS' ELSE 'FAIL' END FROM ANALYTICS.OEE_METRICS
+UNION ALL SELECT 'NOTIFICATION_SETTINGS', COUNT(*), CASE WHEN COUNT(*) >= 7 THEN 'PASS' ELSE 'FAIL' END FROM RAW_IT.NOTIFICATION_SETTINGS
+UNION ALL SELECT 'AMBIENT_CONDITIONS', COUNT(*), CASE WHEN COUNT(*) >= 180  THEN 'PASS' ELSE 'FAIL' END FROM RAW_OT.AMBIENT_CONDITIONS
+ORDER BY TABLE_NAME;
+
+
+-- ============================================================================
+-- 5. ML PIPELINE VALIDATION
+-- ============================================================================
+SELECT
+    ASSET_ID,
+    ASSET_NAME,
+    FAILURE_MODE_PRED,
+    ROUND(RUL_HOURS, 1)         AS RUL_HOURS,
+    STAGE_PRED                   AS DEGRADATION_STAGE,
+    ROUND(DEGRADATION_SCORE, 3)  AS DEGRADATION,
+    ROUND(FATIGUE_SCORE, 3)      AS FATIGUE
+FROM ML_MODELS.LIVE_PREDICTIONS
+ORDER BY RUL_HOURS ASC;
+
+
+-- ============================================================================
+-- 6. PROCUREMENT VIEWS VALIDATION
+-- ============================================================================
+SELECT 'PARTS_AVAILABLE_TO_PROMISE' AS VIEW_NAME,
+    COUNT(*) AS ROWS,
+    CASE WHEN COUNT(*) = 15 THEN 'PASS' ELSE 'FAIL' END AS STATUS
+FROM ANALYTICS.PARTS_AVAILABLE_TO_PROMISE
+UNION ALL
+SELECT 'PROCUREMENT_RECOMMENDATIONS', COUNT(*),
+    CASE WHEN COUNT(*) > 0 THEN 'PASS' ELSE 'WARN' END
+FROM ANALYTICS.PROCUREMENT_RECOMMENDATIONS
+UNION ALL
+SELECT 'PARTS_LIFECYCLE_INSIGHTS', COUNT(*),
+    CASE WHEN COUNT(*) = 15 THEN 'PASS' ELSE 'FAIL' END
+FROM ANALYTICS.PARTS_LIFECYCLE_INSIGHTS;
+
+
+-- ============================================================================
+-- 7. CREDIT CONSUMPTION BY PHASE
+-- ============================================================================
+SELECT
+    CHECKPOINT_NAME AS PHASE,
+    ROUND(CREDITS_USED, 6) AS CREDITS,
+    ROUND(CREDITS_USED / NULLIF(SUM(CREDITS_USED) OVER (), 0) * 100, 1) AS PCT_OF_TOTAL
+FROM MFGPULSE_DB.PUBLIC.DEPLOYMENT_LOG
+WHERE CREDITS_USED > 0
+ORDER BY CREDITS_USED DESC;
+
+
+-- ============================================================================
+-- 8. DYNAMIC TABLE REFRESH STATUS
+-- ============================================================================
+SELECT
+    NAME,
+    SCHEDULING_STATE,
+    LAST_COMPLETED_REFRESH_STATE AS REFRESH_STATE,
+    ROWS_INSERTED,
+    DATA_TIMESTAMP
+FROM TABLE(INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(
+    NAME_PREFIX => 'MFGPULSE_DB'
+))
+WHERE DATA_TIMESTAMP = (
+    SELECT MAX(DATA_TIMESTAMP)
+    FROM TABLE(INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(
+        NAME_PREFIX => 'MFGPULSE_DB'
+    )) sub
+    WHERE sub.NAME = DYNAMIC_TABLE_REFRESH_HISTORY.NAME
+)
+ORDER BY NAME;
+
+
+-- ============================================================================
+-- 9. WAREHOUSE CREDIT USAGE (last 1 hour — deployment window)
+-- ============================================================================
+SELECT
+    WAREHOUSE_NAME,
+    ROUND(SUM(CREDITS_USED), 4) AS CREDITS_USED,
+    COUNT(*) AS METERING_RECORDS
+FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+WHERE START_TIME >= DATEADD('hour', -1, CURRENT_TIMESTAMP())
+GROUP BY WAREHOUSE_NAME
+ORDER BY CREDITS_USED DESC;
+
+
+-- ============================================================================
+-- 10. DEPLOYMENT HEALTH SUMMARY
+-- ============================================================================
+SELECT
+    CASE
+        WHEN failed = 0 AND manual = 0 THEN 'DEPLOYMENT COMPLETE — ALL CHECKPOINTS PASSED'
+        WHEN failed = 0 THEN 'DEPLOYMENT COMPLETE — ' || manual || ' manual steps remaining'
+        ELSE 'DEPLOYMENT INCOMPLETE — ' || failed || ' checkpoint(s) FAILED'
+    END AS DEPLOYMENT_STATUS,
+    passed || '/' || total || ' automated checkpoints passed' AS CHECKPOINT_SUMMARY,
+    ROUND(total_credits, 4) || ' credits consumed' AS CREDIT_SUMMARY,
+    ROUND(total_seconds / 60.0, 1) || ' minutes elapsed' AS TIME_SUMMARY
+FROM (
+    SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN VALIDATION = 'PASS' THEN 1 ELSE 0 END) AS passed,
+        SUM(CASE WHEN VALIDATION = 'FAIL' THEN 1 ELSE 0 END) AS failed,
+        SUM(CASE WHEN VALIDATION = 'SKIP' THEN 1 ELSE 0 END) AS manual,
+        SUM(CREDITS_USED) AS total_credits,
+        SUM(DURATION_SEC) AS total_seconds
+    FROM MFGPULSE_DB.PUBLIC.DEPLOYMENT_LOG
+);

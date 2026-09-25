@@ -5,7 +5,7 @@ artifacts:
     targets:
       default:
         object: MFGPULSE_DB.AGENT.MAINTENANCE_SEMANTIC_VIEW
-  - path: MAINTENANCE_COPILOT.agent.yaml
+  - path: MAINTENANCE_COPILOT_agent.yaml
     type: cortex_agent
     targets:
       default:
