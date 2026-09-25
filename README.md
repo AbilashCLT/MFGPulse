@@ -19,7 +19,7 @@ The platform name combines "MFG" (manufacturing) with "Pulse" (continuous monito
 | **12 ML models** | 7 UDF-based models (classifier, RUL estimator, degradation stager, fatigue detector, root cause analyzer, digital twin simulator, prescriptive engine) + 4 native Snowflake ML models |
 | **13 Dynamic Tables** | Auto-refreshing feature engineering pipeline from raw sensors through curated features to live predictions — no manual ETL |
 | **Monte Carlo Digital Twin** | 100 stochastic simulation paths per scenario (3 scenarios = 300 paths) projecting failure probability at 3, 7, and 14 days |
-| **Cortex AI Agent** | 5-tool conversational assistant: text-to-SQL analytics, RAG search over maintenance logs, full 7-model diagnosis, Monte Carlo simulation, and work order generation |
+| **Cortex AI Agent** | 7-tool conversational assistant: text-to-SQL analytics, RAG search over maintenance logs, fast diagnosis (M1-M4), deep analysis (M5-M7), Monte Carlo simulation, work order generation, and purchase order generation |
 | **Semantic View** | 6 tables with 4 many-to-one relationships, 19 verified queries, module custom instructions (sql_generation for score conventions, severity ordering, OEE formula, table routing; question_categorization for scope definition and out-of-scope rejection) |
 | **Procurement Closed Loop** | ATP calculation, 4-level risk classification (NO_RISK → CRITICAL_SHORTAGE), automated PO generation, planned purchase orders with auto-conversion, supplier management |
 | **Email & In-App Notifications** | Admin-configurable per event type with persona targeting, priority levels, and Snowflake-managed email delivery |
@@ -27,7 +27,7 @@ The platform name combines "MFG" (manufacturing) with "Pulse" (continuous monito
 | **62 Automated Tests** | 9 test files across 11 categories runnable from the Admin Panel with pass/fail tracking and acceptance criteria |
 | **OEE Trend Analysis** | Daily OEE trend line chart per production line with plant-wide average, 85% target reference line, and switchable metric view (OEE, Availability, Performance, Quality) — 185 days of trend data across 6 assets |
 | **Supply Chain Risk Visualizations** | Risk distribution donut chart, lead time gap bar chart by asset, at-risk cost metric, and detailed at-risk parts table — all derived from existing procurement recommendations |
-| **Live Sensor Data Feed** | 24-hour sensor time-series with asset/time-range filtering, latest reading KPIs, channel selector (vibration, temperature, RPM, current), and raw data export in the Operations Center |
+| **Live Sensor Data Feed** | 24-hour sensor time-series with asset/time-range filtering, latest reading KPIs, channel selector (vibration, temperature, RPM, current, acoustic, pressure), and raw data export in the Operations Center |
 | **Data-Driven Summaries** | LLM-generated executive summaries on each dashboard page via Cortex Complete (llama3.1-8b) — boardroom-ready narratives synthesizing KPIs, risks, and recommended actions from live data. Cached per session with regenerate button. |
 | **FinOps Dashboard** | Built-in infrastructure cost monitor — credit consumption by service type, daily trends, query cost breakdown, storage analysis, DT refresh history, and resource monitor status |
 | **Configurable Simulation** | Admin-controlled sensor feed generator — clean or fault scenarios (bearing wear, thermal degradation, imbalance, misalignment) with configurable severity, asset targeting, credit estimation, and production-linked output |
@@ -51,7 +51,7 @@ The platform name combines "MFG" (manufacturing) with "Pulse" (continuous monito
 │  RAW_OT / RAW_IT  →  CURATED (3 DTs)  →  ML_FEATURES (7 DTs)        │
 │         ↓                                        ↓                    │
 │    3 Streams                            LIVE_PREDICTIONS (DT)         │
-│    9-Task DAG                                    ↓                    │
+│    10-Task DAG                                   ↓                    │
 │                                    ┌─────────────┴──────────────┐     │
 │                                    ▼                            ▼     │
 │                              ML_MODELS                    ANALYTICS   │
@@ -62,7 +62,7 @@ The platform name combines "MFG" (manufacturing) with "Pulse" (continuous monito
 │                                    ▼                                  │
 │                                  AGENT                                │
 │                           Semantic View (6 tables, 19 VQRs)            │
-│                           Cortex Agent (5 tools)                      │
+│                           Cortex Agent (7 tools)                      │
 │                                                                       │
 └───────────────────────────────┬───────────────────────────────────────┘
                                 │
@@ -99,44 +99,42 @@ The platform name combines "MFG" (manufacturing) with "Pulse" (continuous monito
 ### Prerequisites
 
 - Snowflake account with `ACCOUNTADMIN` role (or equivalent privileges)
-- Warehouse: `COMPUTE_WH` (interactive) + `MFGPULSE_AUTOMATION_WH` (DAG tasks)
-- Compute pool: `SYSTEM_COMPUTE_POOL_CPU` (for Streamlit)
+- Cortex AI enabled: Cortex Complete, Cortex Search, Cortex Agent, Semantic Views
+- Snowflake ML enabled: Classification, Forecast, AnomalyDetection (Enterprise edition+)
+- Compute pool: `SYSTEM_COMPUTE_POOL_CPU` must exist (required for Streamlit)
 
 ### Deployment Steps
 
-**Step 1 — Run SQL scripts in order**
+**Step 1 — Run the consolidated deployment script**
 
-Execute each script sequentially in a Snowflake SQL worksheet:
+Open a SQL worksheet in Snowsight, set role to `ACCOUNTADMIN`, and run:
 
-| Script | Purpose |
-|---|---|
-| `sql/01_infrastructure.sql` | Database, schemas, warehouse, resource monitor |
-| `sql/02_base_tables.sql` | 19 base tables across RAW_OT and RAW_IT |
-| `sql/03_streams.sql` | 3 CDC streams on sensor readings, maintenance logs, work orders |
-| `sql/04_seed_data.sql` | Reference data: 10 assets, 3 lines, 15 parts, 5 suppliers, 9 users, shifts |
-| `sql/05_generate_sensor_data.sql` | 172K+ synthetic sensor readings (30-day history) |
-| `sql/06_fatigue_scores.sql` | Physics-based fatigue scoring |
-| `sql/07_curated_dynamic_tables.sql` | 3 curated DTs: sensor context, asset health, failure history |
-| `sql/08_ml_feature_dynamic_tables.sql` | 7 feature engineering DTs (rolling stats, interactions, temporal, physics, fleet) |
-| `sql/09_ml_feature_views.sql` | 11 ML feature views |
-| `sql/10_udfs_live_predictions.sql` | 5 UDFs + LIVE_PREDICTIONS dynamic table |
-| `sql/11_native_ml_models.sql` | 4 native Snowflake ML models (classification, forecasting, anomaly detection) |
-| `sql/12_analytics_layer.sql` | Analytics views + ACTIVE_ALERTS and OEE_METRICS DTs |
-| `sql/13_cortex_search.sql` | Cortex Search service over maintenance logs (78 docs) |
-| `sql/14_automation.sql` | 3 scheduled tasks (sensor feed, production, procurement) |
-| `sql/15_procurement_tables.sql` | Procurement tables (suppliers, parts, POs, reservations) |
-| `sql/16_procurement_views.sql` | ATP and procurement recommendation views |
-| `sql/17_procurement_procedures.sql` | PO lifecycle + work order procedures |
-| `sql/18_validation.sql` | Full infrastructure verification suite |
-| `sql/19_notifications.sql` | Notification settings, app notifications, email integration |
+```
+0 - Setup/scripts/deploy_one_time_consolidated.sql
+```
+
+This single script creates everything from zero: 1 database, 7 schemas, 2 warehouses, 23+ tables, 13 dynamic tables, 30+ views, 5 UDFs, 21+ procedures, 10 DAG tasks, 1 Cortex Search service, seed data (~175K+ rows), and a `DEPLOYMENT_LOG` table tracking each phase with timing and validation. Estimated: ~15-25 min, ~1-2 credits.
 
 **Step 2 — Deploy Cortex Semantic View and Agent**
 
-From the `cortex_project/` directory, deploy the Semantic View (6 tables, 4 relationships, 19 VQRs, custom instructions) and the Maintenance Copilot Agent (5 tools) using Snowflake's Cortex project tooling.
+From the `cortex_project/` directory, deploy the Semantic View (6 tables, 4 relationships, 19 VQRs, custom instructions) and the Maintenance Copilot Agent (7 tools) using Snowflake's Cortex project tooling.
 
 **Step 3 — Launch the Streamlit app**
 
 Open `MFGPulse_AI_App/streamlit_app.py` in Snowsight. The app auto-detects the persona from the selected user profile and filters navigation accordingly.
+
+### Helper Scripts
+
+Additional scripts in `0 - Setup/scripts/` for operational scenarios:
+
+| Script | Purpose |
+|---|---|
+| `Share_DB.sql` | Cross-account share and replication setup for MFGPULSE_DB |
+| `Copy Share & Git.sql` | Copy shared database (MFGPULSE_DB_SHARED) into a local writable MFGPULSE_DB |
+| `Truncate and Sync Share.sql` | Truncate local tables and reload from the shared database |
+| `emergency_stop_all_credits.sql` | Emergency suspension of all warehouses, tasks, and compute pools |
+
+See `0 - Setup/DEPLOYMENT_GUIDE.md` for the full deployment walkthrough, prerequisites, verification steps, cross-instance deployment, and teardown instructions.
 
 ---
 
@@ -148,20 +146,20 @@ Open `MFGPulse_AI_App/streamlit_app.py` in Snowsight. The app auto-detects the p
 | **Base Tables** | 32 | Including NOTIFICATION_SETTINGS, APP_NOTIFICATIONS, SIMULATION_CONFIG, PART_RESERVATIONS, PURCHASE_ORDERS (with rejection tracking), WORK_ORDERS (with root cause + part used) |
 | **Dynamic Tables** | 13 | 3 curated + 7 features + LIVE_PREDICTIONS + ACTIVE_ALERTS + OEE_METRICS |
 | **Views** | 26 | 12 analytics (incl. PROCUREMENT_PERFORMANCE, SUPPLIER_SCORECARD) + 14 ML feature/training views |
-| **Procedures** | 17 | Including DAG support (REFRESH_FATIGUE_SCORES, REFRESH_ALL_DTS, SIMULATE_ALL_FEEDS_RANDOM), WO/PO lifecycle, notifications |
+| **Procedures** | 25+ | Including DAG support (REFRESH_FATIGUE_SCORES, REFRESH_ALL_DTS, SIMULATE_ALL_FEEDS_RANDOM), WO/PO lifecycle, notifications, drift detection, KPI snapshots |
 | **UDFs** | 5 | Failure mode, RUL, degradation, fatigue, digital twin simulator |
 | **ML Models** | 12 | 8 UDF-based (M1-M7) + 4 native Snowflake ML |
 | **Streams** | 3 | Sensor readings, maintenance logs, work orders |
-| **Tasks (DAG)** | 6 | MFGPULSE_AUTOMATION_DAG → Fatigue → DTs → WOs → POs → PPOs (on MFGPULSE_AUTOMATION_WH) |
+| **Tasks (DAG)** | 10 | MFGPULSE_AUTOMATION_DAG (root) → CHECK_FRESHNESS ∥ REFRESH_FATIGUE → REFRESH_DTS → ARCHIVE_ALERTS ∥ CHECK_DRIFT ∥ GENERATE_WOS → GENERATE_POS → CONVERT_PPOS → SNAPSHOT_KPIS (on MFGPULSE_AUTOMATION_WH) |
 | **Warehouses** | 2 | COMPUTE_WH (interactive) + MFGPULSE_AUTOMATION_WH (DAG tasks) |
 | **Resource Monitors** | 3 | HARDSTOP (account), MFGPULSE_CREDIT_GUARD (COMPUTE_WH), MFGPULSE_AUTOMATION_GUARD (automation WH) |
 | **Cortex Search** | 1 | MAINTENANCE_SEARCH (78 indexed docs) |
 | **Semantic View** | 1 | MAINTENANCE_SEMANTIC_VIEW (6 tables, 4 relationships, 19 VQRs, module custom instructions) |
-| **Cortex Agent** | 1 | MAINTENANCE_COPILOT (5 tools) |
+| **Cortex Agent** | 1 | MAINTENANCE_COPILOT (7 tools: maintenance_analytics, maintenance_history, diagnose_asset, deep_analysis, simulate_scenario, generate_work_order, generate_purchase_order) |
 | **Notification Integration** | 1 | MFGPULSE_EMAIL (TYPE=EMAIL) |
 | **Streamlit Pages** | 9 | Executive, Operations, WO/PO, Maintenance, Procurement, Digital Twin, Admin, Copilot |
 | **Sensor Readings** | 172K+ | 30-day history, 15-min intervals, 10 assets |
-| **Test Cases** | 80+ | 11 categories, runnable from Admin Panel |
+| **Test Cases** | 62 | 11 categories, runnable from Admin Panel |
 
 ---
 
@@ -174,7 +172,7 @@ Open `MFGPulse_AI_App/streamlit_app.py` in Snowsight. The app auto-detects the p
 | **ML Models** | SQL UDFs + Snowflake.ML (Classification, Forecast, AnomalyDetection) |
 | **LLM** | Snowflake Cortex Complete (llama3.1-70b) |
 | **RAG** | Cortex Search (78 maintenance docs, SEARCH_PREVIEW enabled) |
-| **AI Agent** | Cortex Agent (DATA_AGENT_RUN, 5 tools) |
+| **AI Agent** | Cortex Agent (DATA_AGENT_RUN, 7 tools) |
 | **Semantic Layer** | Cortex Semantic View (6 tables, 4 relationships, 19 VQRs, module custom instructions) |
 | **Frontend** | Streamlit in Snowflake (multipage, st.navigation) |
 | **Notifications** | SYSTEM$SEND_SNOWFLAKE_NOTIFICATION + APP_NOTIFICATIONS table |
@@ -191,59 +189,55 @@ Open `MFGPulse_AI_App/streamlit_app.py` in Snowsight. The app auto-detects the p
 ## Project Structure
 
 ```
-MFGPulse_AI/
-├── MFGPulse_AI_App/          # Streamlit application
-│   ├── streamlit_app.py               # Entry point — persona login, navigation, notifications
-│   ├── snowflake.yml                  # Deployment manifest
-│   ├── pyproject.toml                 # Python dependencies
-│   ├── .streamlit/config.toml         # Theme configuration
+MFGPulse/                                 # Workspace root
+├── README.md                             # This file
+├── .gitignore
+│
+├── 0 - Setup/                            # Deployment & operations
+│   ├── DEPLOYMENT_GUIDE.md               # Full deployment walkthrough + cross-instance instructions
+│   └── scripts/
+│       ├── deploy_one_time_consolidated.sql   # Master deployment (14 checkpoints, all DDL + seed data)
+│       ├── Share_DB.sql                       # Cross-account share & replication setup
+│       ├── Copy Share & Git.sql               # Copy shared DB into local writable MFGPULSE_DB
+│       ├── Truncate and Sync Share.sql        # Reload local tables from shared database
+│       └── emergency_stop_all_credits.sql     # Emergency suspension of all resources
+│
+├── 1 - docs/                             # Documentation
+│   ├── TECHNICAL_GUIDE.md                # Architecture, data model, ML pipeline, security
+│   ├── USER_GUIDE.md                     # Per-persona walkthrough with workflows
+│   └── PROCESS_FLOW.md                   # 12 business/technical process flow diagrams with DAG details
+│
+├── MFGPulse_AI_App/                      # Streamlit application
+│   ├── streamlit_app.py                  # Entry point — persona login, navigation, notifications
+│   ├── snowflake.yml                     # Deployment manifest (MFGPULSE_DB.AGENT.MFGPULSE_AI_APP)
+│   ├── pyproject.toml                    # Python dependencies
+│   ├── .streamlit/config.toml            # Dark industrial theme configuration
 │   └── app_pages/
-│       ├── _shared.py                 # Centralized data loaders, constants, formatters
-│       ├── executive_dashboard.py     # Plant-wide KPIs, OEE, cost analysis
-│       ├── operations_dashboard.py    # Fleet status, alert triage, shift handover
-│       ├── wo_po_console.py           # Work order / purchase order management
-│       ├── maintenance_dashboard.py   # Asset-level diagnostics, failure DNA
-│       ├── procurement_dashboard.py   # ATP, risk recommendations, PO management
-│       ├── digital_twin.py            # Monte Carlo simulation comparisons
-│       ├── admin_control_panel.py     # Infrastructure, notifications, test suite
-│       └── copilot.py                 # Cortex Agent conversational interface
+│       ├── _shared.py                    # Centralized data loaders, constants, formatters
+│       ├── executive_dashboard.py        # Plant-wide KPIs, OEE, cost analysis
+│       ├── operations_dashboard.py       # Fleet status, alert triage, shift handover
+│       ├── wo_po_console.py              # Work order / purchase order management
+│       ├── maintenance_dashboard.py      # Asset-level diagnostics, failure DNA
+│       ├── procurement_dashboard.py      # ATP, risk recommendations, PO management
+│       ├── digital_twin.py              # Monte Carlo simulation comparisons
+│       ├── admin_control_panel.py        # Infrastructure, notifications, test suite
+│       └── copilot.py                    # Cortex Agent conversational interface
 │
-├── sql/                               # DDL & seed data (run in order: 01 → 20)
-│   ├── 01_infrastructure.sql          # Database, schemas, warehouse
-│   ├── 02_base_tables.sql             # 19 base tables
-│   ├── ...                            # (see Deployment Steps above)
-│   ├── 16_procurement_views.sql       # 5 procurement views (ATP, Recs, Lifecycle, Performance, Scorecard)
-│   ├── 19_notifications.sql           # Notification system
-│   ├── 20_configurable_simulation.sql # Configurable simulation
-│   ├── deploy_one_time_consolidated.sql # Master deployment script (4800+ lines, fully self-contained)
-│   ├── deployment_report.sql          # Post-deployment verification report
-│   ├── credit_consumption_report.sql  # Credit usage analysis and cost projections
-│   └── ddl_objects.sql                # Executable UDF + procedure DDL for cross-instance deployment
+├── cortex_project/                       # Cortex AI definitions
+│   ├── cortex_project.yaml              # Project manifest
+│   ├── MAINTENANCE_SEMANTIC_VIEW.sv.yaml # Semantic View (6 tables, 4 relationships, 19 VQRs, custom instructions)
+│   └── MAINTENANCE_COPILOT_agent.yaml   # Cortex Agent (7 tools)
 │
-├── cortex_project/                    # Cortex AI definitions
-│   ├── cortex_project.yaml            # Project manifest
-│   ├── MAINTENANCE_SEMANTIC_VIEW.sv.yaml   # Semantic View (6 tables, 4 relationships, 19 VQRs, custom instructions)
-│   └── MAINTENANCE_COPILOT_agent.yaml      # Cortex Agent (5 tools)
-│
-├── test_cases/                        # 62 automated test cases
-│   ├── test_data_integrity.sql        # TC-01: Schema, row counts, FKs, DTs (12 tests)
-│   ├── test_ml_pipeline.sql           # TC-02: Predictions, value ranges, UDFs (11 tests)
-│   ├── test_procurement.sql           # TC-03: ATP math, risk enums (5 tests)
-│   ├── test_notifications.sql         # TC-04: Event types, persona targeting (3 tests)
-│   ├── test_wo_po_lifecycle.sql       # TC-05: Status transitions, completion (5 tests)
-│   ├── test_simulation_scenarios.sql  # TC-06: Probability bounds, load effects (4 tests)
-│   ├── test_copilot_scenarios.sql     # TC-07: Search coverage, accuracy benchmarks (2+ tests)
-│   └── test_persona_access.py         # TC-08: Page access matrix (11 tests)
-│
-├── docs/                              # Documentation
-│   ├── README.md                      # This file
-│   ├── TECHNICAL_GUIDE.md             # Architecture, data model, ML pipeline, security
-│   ├── USER_GUIDE.md                  # Per-persona walkthrough with workflows
-│   ├── TEST_CASES_GUIDE.md            # Test catalog and acceptance criteria
-│   └── full_ddl_export.sql            # Consolidated DDL for reference
-│
-├── PLAN.md                            # Implementation plan (7 phases)
-└── PLAN_v1_original.md                # Original plan (pre-revision)
+└── test_cases/                           # 62 automated tests across 9 files
+    ├── test_data_integrity.sql           # TC-01: Schema, row counts, FKs, DTs (12 tests)
+    ├── test_ml_pipeline.sql              # TC-02: Predictions, value ranges, UDFs (10 tests)
+    ├── test_procurement.sql              # TC-03: ATP math, risk enums (5 tests)
+    ├── test_notifications.sql            # TC-04: Event types, persona targeting (3 tests)
+    ├── test_wo_po_lifecycle.sql          # TC-05: Status transitions, completion (11 tests)
+    ├── test_simulation_scenarios.sql     # TC-06: Probability bounds, load effects (4 tests)
+    ├── test_copilot_scenarios.sql        # TC-07: Search coverage, accuracy benchmarks (2 tests)
+    ├── test_persona_access.py            # TC-08: Page access matrix (5 tests)
+    └── test_ml_edge_cases.sql            # TC-11: ML UDF boundary, null, zero, extreme inputs (10 tests)
 ```
 
 ---
@@ -252,14 +246,9 @@ MFGPulse_AI/
 
 | Document | Audience | Content |
 |---|---|---|
-| **[TECHNICAL_GUIDE.md](TECHNICAL_GUIDE.md)** | Developers, DBAs | Architecture, data model, ML pipeline, dynamic table chain, notification system, security model |
-| **[USER_GUIDE.md](USER_GUIDE.md)** | End users, operators | Per-persona page walkthroughs, workflow guides, FAQ, tips |
-| **[DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)** | DevOps, DBAs | Full deployment walkthrough + cross-instance deployment instructions |
-| **[TEST_CASES_GUIDE.md](TEST_CASES_GUIDE.md)** | QA, developers | Test catalog with IDs, descriptions, acceptance criteria, how to run |
-| **[full_ddl_export.sql](full_ddl_export.sql)** | DBAs | Consolidated DDL for all database objects |
+| **[TECHNICAL_GUIDE.md](1%20-%20docs/TECHNICAL_GUIDE.md)** | Developers, DBAs | Architecture, data model, ML pipeline, dynamic table chain, notification system, security model |
+| **[USER_GUIDE.md](1%20-%20docs/USER_GUIDE.md)** | End users, operators | Per-persona page walkthroughs, workflow guides, FAQ, tips |
+| **[PROCESS_FLOW.md](1%20-%20docs/PROCESS_FLOW.md)** | Engineers, architects | 12 end-to-end process flow diagrams: data ingestion, feature engineering, prediction, alerts, WO/PO lifecycle, notifications, drift detection, shift handover, digital twin, copilot, DAG automation |
+| **[DEPLOYMENT_GUIDE.md](0%20-%20Setup/DEPLOYMENT_GUIDE.md)** | DevOps, DBAs | Full deployment walkthrough, prerequisites, verification, cross-instance replication, teardown |
 
 ---
-
-## Credits
-
-Built on **Snowflake** using Dynamic Tables, Cortex AI (Complete, Search, Agent, Semantic Views), Snowflake ML, and Streamlit in S
