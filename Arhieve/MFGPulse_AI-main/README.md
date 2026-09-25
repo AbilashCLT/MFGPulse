@@ -1,1 +1,0 @@
-# MFGPulse_AI

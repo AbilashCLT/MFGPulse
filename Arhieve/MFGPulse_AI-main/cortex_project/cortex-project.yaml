@@ -1,9 +1,0 @@
-version: 1
-artifacts:
-  - path: ../MFGPulse_AI/cortex_project/MAINTENANCE_SEMANTIC_VIEW.sv.yaml
-    type: semantic_view
-    targets:
-      MFGPulse_Copilot:
-        object: MFGPULSE_DB.AGENT.MAINTENANCE_SEMANTIC_VIEW
-      default:
-        object: MFGPULSE_DB.AGENT.MAINTENANCE_SEMANTIC_VIEW

@@ -1,9 +1,0 @@
-[
-  {
-    "index": 53,
-    "line": 3932,
-    "preview": "INSERT INTO ML_MODELS.FATIGUE_SCORES (ASSET_ID, TIMESTAMP,",
-    "error": "002141 (42601): SQL compilation error:",
-    "stmt": "INSERT INTO ML_MODELS.FATIGUE_SCORES (ASSET_ID, TIMESTAMP, FATIGUE_SCORE, FATIGUE_LEVEL)\nSELECT\n    rs.asset_id, rs.timestamp,\n    ML_MODELS.COMPUTE_FATIGUE_SCORE(\n        rs.vib_crest_factor_6h, rs.vib_coeff_var_6h, rs.vib_peak_to_peak_6h,\n        rs.vib_rate_of_change_1h, rs.vib_acceleration_1h,\n        si.acoustic_vib_ratio, pc.stress_index,\n        COALESCE(si.vib_xy_correlation_daily, 0),\n        COALESCE(si.acoustic_vib_ratio, 0)\n    ) AS fatigue_score,\n    CASE\n        WHEN ML_MODELS.COMP"
-  }
-]
