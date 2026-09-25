@@ -1,0 +1,14 @@
+-- ============================================================================
+-- MFGPulse AI: 07 Curated Dynamic Tables
+-- SENSOR_WITH_CONTEXT, ASSET_HEALTH_CURRENT, FAILURE_HISTORY
+-- ============================================================================
+-- Full DDL extracted from deployed objects via GET_DDL('DYNAMIC TABLE', ...)
+-- All 3 DTs: TARGET_LAG = '2 days', REFRESH_MODE = AUTO, WAREHOUSE = COMPUTE_WH
+-- To recreate, run GET_DDL for each:
+--   GET_DDL('DYNAMIC TABLE', 'MFGPULSE_DB.CURATED.SENSOR_WITH_CONTEXT')
+--   GET_DDL('DYNAMIC TABLE', 'MFGPULSE_DB.CURATED.ASSET_HEALTH_CURRENT')
+--   GET_DDL('DYNAMIC TABLE', 'MFGPULSE_DB.CURATED.FAILURE_HISTORY')
+
+-- SENSOR_WITH_CONTEXT: Enriches raw sensor readings with asset metadata, vibration magnitude, temp/rpm ratios, hours since last maintenance. 172K rows.
+-- ASSET_HEALTH_CURRENT: Latest reading per asset with 24h stats and computed health_score (0-100). 10 rows.
+-- FAILURE_HISTORY: Pre-failure sensor statistics (7-day window before each WO) for failure pattern analysis. 12 rows.

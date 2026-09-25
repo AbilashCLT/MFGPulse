@@ -1,0 +1,919 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MFGPulse AI — Executive Dashboard (Design Preview)</title>
+<style>
+/* ═══════════════════════════════════════════════════════════════
+   MFGPulse AI — Executive Dashboard Design Preview
+   Dark Industrial Futuristic Theme
+   ═══════════════════════════════════════════════════════════════ */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+    --bg-primary:   #0A0E1A;
+    --bg-secondary: #111827;
+    --bg-card:      rgba(17, 24, 39, 0.85);
+    --bg-card-hover:rgba(17, 24, 39, 0.95);
+    --cyan:         #00D4FF;
+    --cyan-dim:     rgba(0, 212, 255, 0.15);
+    --red:          #EF4444;
+    --orange:       #F59E0B;
+    --green:        #10B981;
+    --purple:       #8B5CF6;
+    --blue:         #3B82F6;
+    --text-primary: #E0E7FF;
+    --text-secondary:#94A3B8;
+    --text-muted:   #64748B;
+    --border:       rgba(0, 212, 255, 0.12);
+    --glow-cyan:    0 0 20px rgba(0, 212, 255, 0.08);
+    --glow-red:     0 0 15px rgba(239, 68, 68, 0.12);
+    --glow-green:   0 0 15px rgba(16, 185, 129, 0.12);
+    --glow-orange:  0 0 15px rgba(245, 158, 11, 0.12);
+    --glow-purple:  0 0 15px rgba(139, 92, 246, 0.12);
+    --radius:       10px;
+    --radius-sm:    6px;
+}
+
+body {
+    background: linear-gradient(135deg, var(--bg-primary) 0%, #0D1321 50%, var(--bg-primary) 100%);
+    color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    min-height: 100vh;
+    padding: 24px 32px;
+}
+
+/* Typography */
+.label {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-weight: 600;
+    color: var(--text-muted);
+}
+.label-cyan   { color: var(--cyan); }
+.label-red    { color: var(--red); }
+.label-green  { color: var(--green); }
+.label-orange { color: var(--orange); }
+.label-purple { color: var(--purple); }
+
+.value-xl {
+    font-size: 2rem;
+    font-weight: 800;
+    line-height: 1.1;
+}
+.value-lg {
+    font-size: 1.4rem;
+    font-weight: 700;
+    line-height: 1.2;
+}
+.value-md {
+    font-size: 1.1rem;
+    font-weight: 700;
+}
+.text-cyan   { color: var(--cyan); }
+.text-red    { color: var(--red); }
+.text-green  { color: var(--green); }
+.text-orange { color: var(--orange); }
+.text-purple { color: var(--purple); }
+.text-muted  { color: var(--text-muted); }
+.text-secondary { color: var(--text-secondary); }
+
+/* Layout */
+.grid { display: grid; gap: 12px; }
+.grid-2 { grid-template-columns: 1fr 1fr; }
+.grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+.grid-4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
+.grid-5 { grid-template-columns: 1fr 1fr 1fr 1fr 1fr; }
+.flex { display: flex; gap: 12px; }
+.flex-center { align-items: center; }
+.flex-between { justify-content: space-between; }
+
+/* Cards */
+.card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    box-shadow: var(--glow-cyan);
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+.card:hover {
+    border-color: rgba(0, 212, 255, 0.25);
+    box-shadow: 0 0 25px rgba(0, 212, 255, 0.12);
+}
+.card-glow-red {
+    border-color: rgba(239,68,68,0.2);
+    border-left: 3px solid var(--red);
+    box-shadow: var(--glow-red);
+}
+.card-glow-green {
+    border-color: rgba(16,185,129,0.2);
+    border-left: 3px solid var(--green);
+    box-shadow: var(--glow-green);
+}
+.card-glow-orange {
+    border-color: rgba(245,158,11,0.2);
+    border-left: 3px solid var(--orange);
+    box-shadow: var(--glow-orange);
+}
+.card-glow-purple {
+    border-color: rgba(139,92,246,0.2);
+    border-left: 3px solid var(--purple);
+    box-shadow: var(--glow-purple);
+}
+.card-glow-cyan {
+    border-color: rgba(0,212,255,0.2);
+    border-left: 3px solid var(--cyan);
+    box-shadow: var(--glow-cyan);
+}
+
+/* Section headers */
+.section-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 28px 0 14px 0;
+}
+.section-header .icon {
+    font-size: 1rem;
+}
+.section-header .title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-weight: 600;
+    color: var(--cyan);
+}
+
+/* Badges */
+.badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 0.62rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.badge-red    { background: rgba(239,68,68,0.15); color: var(--red); border: 1px solid rgba(239,68,68,0.3); }
+.badge-orange { background: rgba(245,158,11,0.15); color: var(--orange); border: 1px solid rgba(245,158,11,0.3); }
+.badge-green  { background: rgba(16,185,129,0.15); color: var(--green); border: 1px solid rgba(16,185,129,0.3); }
+.badge-blue   { background: rgba(59,130,246,0.15); color: var(--blue); border: 1px solid rgba(59,130,246,0.3); }
+.badge-cyan   { background: rgba(0,212,255,0.1); color: var(--cyan); border: 1px solid rgba(0,212,255,0.25); }
+.badge-purple { background: rgba(139,92,246,0.15); color: var(--purple); border: 1px solid rgba(139,92,246,0.3); }
+
+/* OEE Gauge */
+.gauge-container {
+    position: relative;
+    width: 90px;
+    height: 90px;
+    margin: 0 auto 8px auto;
+}
+.gauge-bg {
+    fill: none;
+    stroke: rgba(255,255,255,0.06);
+    stroke-width: 8;
+}
+.gauge-fill {
+    fill: none;
+    stroke-width: 8;
+    stroke-linecap: round;
+    transform: rotate(-90deg);
+    transform-origin: center;
+    filter: drop-shadow(0 0 6px var(--orange));
+}
+.gauge-text {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+}
+
+/* Bar chart (CSS) */
+.bar-group { display: flex; align-items: flex-end; gap: 3px; height: 120px; }
+.bar {
+    flex: 1;
+    border-radius: 3px 3px 0 0;
+    min-width: 12px;
+    position: relative;
+    transition: height 0.4s ease;
+}
+.bar::after {
+    content: attr(data-val);
+    position: absolute;
+    top: -16px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 0.58rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+.bar-label {
+    text-align: center;
+    font-size: 0.6rem;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+/* Horizontal bar */
+.hbar-track {
+    background: rgba(255,255,255,0.04);
+    border-radius: 3px;
+    height: 8px;
+    overflow: hidden;
+    margin: 4px 0;
+}
+.hbar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.5s ease;
+}
+
+/* Donut chart (CSS) */
+.donut {
+    width: 140px;
+    height: 140px;
+    border-radius: 50%;
+    position: relative;
+    margin: 0 auto;
+}
+.donut-center {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    text-align: center;
+}
+
+/* Table */
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+}
+.data-table th {
+    text-align: left;
+    padding: 8px 12px;
+    color: var(--text-muted);
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+}
+.data-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    color: var(--text-primary);
+}
+.data-table tr:hover td {
+    background: rgba(0,212,255,0.03);
+}
+
+/* SVG Line Chart */
+.line-chart-container {
+    position: relative;
+    width: 100%;
+    height: 200px;
+    overflow: visible;
+}
+
+/* Watermark */
+.watermark {
+    text-align: center;
+    padding: 30px 0 10px 0;
+    border-top: 1px solid var(--border);
+    margin-top: 40px;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+    .grid-4, .grid-5 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr; }
+    .grid-2 { grid-template-columns: 1fr; }
+    body { padding: 12px 16px; }
+}
+</style>
+</head>
+<body>
+
+<!-- ════════════════════════════════════════════════════════════
+     SECTION 1: Page Header
+     ════════════════════════════════════════════════════════════ -->
+<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+    <div style="display:flex; align-items:center; gap:14px;">
+        <div style="font-size:1.5rem; font-weight:800; color:var(--text-primary);">
+            ⚙ Executive dashboard
+        </div>
+        <span class="badge badge-cyan">Plant overview</span>
+    </div>
+    <div style="display:flex; align-items:center; gap:8px;">
+        <span class="badge badge-green">● Live</span>
+        <span style="font-size:0.68rem; color:var(--text-muted);">Sensor data: 2 min ago</span>
+    </div>
+</div>
+<p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:20px;">
+    Plant-wide KPIs, OEE trends, cost impact, and supply chain risk
+</p>
+
+
+<!-- ════════════════════════════════════════════════════════════
+     SECTION 2: Hero KPI Strip — 4 Primary Metrics
+     ════════════════════════════════════════════════════════════ -->
+<div class="grid grid-4">
+    <!-- Plant OEE with gauge -->
+    <div class="card" style="text-align:center;">
+        <div class="label label-cyan" style="margin-bottom:10px;">⚡ Plant OEE</div>
+        <div class="gauge-container">
+            <svg viewBox="0 0 100 100" width="90" height="90">
+                <circle class="gauge-bg" cx="50" cy="50" r="40"/>
+                <circle class="gauge-fill" cx="50" cy="50" r="40"
+                    stroke="var(--orange)"
+                    stroke-dasharray="161 251"
+                    style="filter: drop-shadow(0 0 8px rgba(245,158,11,0.5));"/>
+            </svg>
+            <div class="gauge-text">
+                <div class="value-xl text-orange">64.2</div>
+                <div style="font-size:0.65rem; color:var(--text-muted);">%</div>
+            </div>
+        </div>
+        <div style="font-size:0.7rem; color:var(--text-muted);">Target: <span class="text-green">85%</span></div>
+        <div style="margin-top:6px;">
+            <span class="badge badge-orange">▼ 20.8% below target</span>
+        </div>
+    </div>
+
+    <!-- Critical Assets -->
+    <div class="card card-glow-red" style="text-align:center;">
+        <div class="label label-red" style="margin-bottom:10px;">🔴 Critical assets</div>
+        <div class="value-xl text-red" style="margin-bottom:4px;">0</div>
+        <div style="font-size:0.9rem; color:var(--text-secondary);">/ 10 total</div>
+        <div style="margin-top:10px; display:flex; justify-content:center; gap:6px;">
+            <span class="badge badge-orange">7 warning</span>
+            <span class="badge badge-green">3 healthy</span>
+        </div>
+        <div style="margin-top:10px;">
+            <div class="hbar-track">
+                <div class="hbar-fill" style="width:70%; background:linear-gradient(90deg, var(--orange), var(--orange));
+                     box-shadow: 0 0 8px rgba(245,158,11,0.4);"></div>
+            </div>
+            <div style="font-size:0.6rem; color:var(--text-muted); margin-top:2px;">70% in warning stage</div>
+        </div>
+    </div>
+
+    <!-- Cost Avoided -->
+    <div class="card card-glow-green" style="text-align:center;">
+        <div class="label label-green" style="margin-bottom:10px;">💰 Cost avoided</div>
+        <div class="value-xl text-green">$50,400</div>
+        <div style="font-size:0.72rem; color:var(--text-muted); margin-top:4px;">
+            by predictive maintenance
+        </div>
+        <div style="margin-top:10px;">
+            <div style="display:flex; justify-content:center; gap:16px;">
+                <div>
+                    <div style="font-size:0.6rem; color:var(--text-muted); text-transform:uppercase;">Avg failure</div>
+                    <div class="value-md text-red">$8,943</div>
+                </div>
+                <div>
+                    <div style="font-size:0.6rem; color:var(--text-muted); text-transform:uppercase;">Avg repair</div>
+                    <div class="value-md text-green">$1,743</div>
+                </div>
+            </div>
+        </div>
+        <div style="margin-top:8px;">
+            <span class="badge badge-green">5.1× cost multiplier if undetected</span>
+        </div>
+    </div>
+
+    <!-- Maintenance ROI -->
+    <div class="card card-glow-cyan" style="text-align:center;">
+        <div class="label label-cyan" style="margin-bottom:10px;">📊 Maintenance ROI</div>
+        <div class="value-xl text-cyan">4.1×</div>
+        <div style="font-size:0.72rem; color:var(--text-muted); margin-top:4px;">
+            return on $5,700 spend
+        </div>
+        <div style="margin-top:12px;">
+            <div style="display:flex; align-items:center; gap:8px; justify-content:center;">
+                <div style="width:60px; font-size:0.6rem; color:var(--text-muted); text-align:right;">Spend</div>
+                <div class="hbar-track" style="flex:1; max-width:120px;">
+                    <div class="hbar-fill" style="width:11%; background:var(--cyan);
+                         box-shadow: 0 0 6px rgba(0,212,255,0.4);"></div>
+                </div>
+            </div>
+            <div style="display:flex; align-items:center; gap:8px; justify-content:center; margin-top:4px;">
+                <div style="width:60px; font-size:0.6rem; color:var(--text-muted); text-align:right;">Avoided</div>
+                <div class="hbar-track" style="flex:1; max-width:120px;">
+                    <div class="hbar-fill" style="width:100%; background:var(--green);
+                         box-shadow: 0 0 6px rgba(16,185,129,0.4);"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<!-- ════════════════════════════════════════════════════════════
+     SECTION 3: Secondary KPI Strip — 4 Compact Metrics
+     ════════════════════════════════════════════════════════════ -->
+<div class="grid grid-4" style="margin-top:12px;">
+    <div class="card" style="text-align:center;">
+        <div class="label" style="margin-bottom:6px;">🔍 Early detection</div>
+        <div class="value-lg text-cyan">23 days</div>
+        <div style="font-size:0.65rem; color:var(--text-muted);">avg advance warning</div>
+        <div style="font-size:0.6rem; color:var(--text-muted); margin-top:4px;">Max: 100 days</div>
+    </div>
+    <div class="card" style="text-align:center;">
+        <div class="label" style="margin-bottom:6px;">🚨 Emergency WOs</div>
+        <div class="value-lg text-red">2</div>
+        <div style="font-size:0.65rem; color:var(--text-muted);">open / in-progress</div>
+        <div style="margin-top:6px; display:flex; justify-content:center; gap:6px;">
+            <span class="badge badge-orange">2 corrective</span>
+            <span class="badge badge-green">1 preventive</span>
+        </div>
+    </div>
+    <div class="card" style="text-align:center;">
+        <div class="label" style="margin-bottom:6px;">💸 Total spend</div>
+        <div class="value-lg text-orange">$5,700</div>
+        <div style="font-size:0.65rem; color:var(--text-muted);">maintenance budget</div>
+        <div style="margin-top:6px;">
+            <span class="badge badge-green">ROI positive</span>
+        </div>
+    </div>
+    <div class="card" style="text-align:center;">
+        <div class="label" style="margin-bottom:6px;">📈 OEE improvement</div>
+        <div class="value-lg text-green">+5.3%</div>
+        <div style="font-size:0.65rem; color:var(--text-muted);">potential uplift</div>
+        <div class="hbar-track" style="margin-top:8px;">
+            <div class="hbar-fill" style="width:64.2%; background:var(--orange);"></div>
+        </div>
+        <div style="display:flex; justify-content:space-between; font-size:0.58rem; color:var(--text-muted);">
+            <span>64.2%</span>
+            <span>→ 69.5%</span>
+            <span>85% target</span>
+        </div>
+    </div>
+</div>
+
+
+<!-- ════════════════════════════════════════════════════════════
+     SECTION 4: AI Executive Summary
+     ════════════════════════════════════════════════════════════ -->
+<div class="section-header">
+    <span class="icon">🤖</span>
+    <span class="title" style="color:var(--purple);">AI executive summary</span>
+    <span class="badge badge-purple">Cortex LLM</span>
+</div>
+
+<div class="card card-glow-purple">
+    <div style="display:flex; gap:16px;">
+        <div style="flex:1;">
+            <p style="color:var(--text-primary); font-size:0.82rem; line-height:1.6; margin-bottom:10px;">
+                <strong style="color:var(--purple);">Executive Summary:</strong> Plant OEE at 64.2% is significantly below the 85% industry target, driven by performance efficiency gaps across all three production lines. Zero critical assets currently, though 7 of 10 assets are in warning stage requiring proactive intervention.
+            </p>
+            <p style="color:var(--text-secondary); font-size:0.78rem; line-height:1.6; margin-bottom:10px;">
+                <strong>Key Outcomes:</strong> Predictive maintenance has avoided $50,400 in potential failure costs — a 4.1× ROI on $5,700 total spend. Early detection averaging 23 days provides adequate intervention window. Emergency repair costs ($8,943 avg) are 5.1× higher than planned repairs ($1,743 avg), reinforcing the value of the predictive approach.
+            </p>
+            <p style="color:var(--text-secondary); font-size:0.78rem; line-height:1.6;">
+                <strong>Risks:</strong> Compressor A1 and A2 show imbalance failure modes with RUL under 120h. Three parts have critical shortage status — escalation required. 
+                <strong>Action needed:</strong> Prioritize Compressor A1 maintenance (48h RUL), expedite shaft sleeve procurement, and target performance efficiency improvements to close the 20.8% OEE gap.
+            </p>
+        </div>
+    </div>
+</div>
+
+
+<!-- ════════════════════════════════════════════════════════════
+     SECTION 5: OEE by Production Line + Loss Attribution
+     ════════════════════════════════════════════════════════════ -->
+<div class="section-header">
+    <span class="icon">📊</span>
+    <span class="title">OEE by production line</span>
+</div>
+
+<div class="grid grid-2">
+    <!-- OEE by line -->
+    <div class="card">
+        <div class="label label-cyan" style="margin-bottom:14px;">Availability · Performance · Quality · OEE</div>
+        
+        <div style="display:flex; gap:20px; align-items:flex-end;">
+            <!-- LINE_01 -->
+            <div style="flex:1; text-align:center;">
+                <div class="bar-group">
+                    <div class="bar" data-val="90.0" style="height:90%; background:var(--blue); box-shadow:0 0 6px rgba(59,130,246,0.3);"></div>
+                    <div class="bar" data-val="77.5" style="height:77.5%; background:var(--orange); box-shadow:0 0 6px rgba(245,158,11,0.3);"></div>
+                    <div class="bar" data-val="91.8" style="height:91.8%; background:var(--purple); box-shadow:0 0 6px rgba(139,92,246,0.3);"></div>
+                    <div class="bar" data-val="63.6" style="height:63.6%; background:var(--green); box-shadow:0 0 6px rgba(16,185,129,0.3);"></div>
+                </div>
+                <div class="bar-label">LINE 01</div>
+            </div>
+            <!-- LINE_02 -->
+            <div style="flex:1; text-align:center;">
+                <div class="bar-group">
+                    <div class="bar" data-val="91.7" style="height:91.7%; background:var(--blue); box-shadow:0 0 6px rgba(59,130,246,0.3);"></div>
+                    <div class="bar" data-val="76.5" style="height:76.5%; background:var(--orange); box-shadow:0 0 6px rgba(245,158,11,0.3);"></div>
+                    <div class="bar" data-val="90.8" style="height:90.8%; background:var(--purple); box-shadow:0 0 6px rgba(139,92,246,0.3);"></div>
+                    <div class="bar" data-val="63.5" style="height:63.5%; background:var(--green); box-shadow:0 0 6px rgba(16,185,129,0.3);"></div>
+                </div>
+                <div class="bar-label">LINE 02</div>
+            </div>
+            <!-- LINE_03 -->
+            <div style="flex:1; text-align:center;">
+                <div class="bar-group">
+                    <div class="bar" data-val="91.1" style="height:91.1%; background:var(--blue); box-shadow:0 0 6px rgba(59,130,246,0.3);"></div>
+                    <div class="bar" data-val="79.3" style="height:79.3%; background:var(--orange); box-shadow:0 0 6px rgba(245,158,11,0.3);"></div>
+                    <div class="bar" data-val="92.0" style="height:92.0%; background:var(--purple); box-shadow:0 0 6px rgba(139,92,246,0.3);"></div>
+                    <div class="bar" data-val="66.7" style="height:66.7%; background:var(--green); box-shadow:0 0 6px rgba(16,185,129,0.3);"></div>
+                </div>
+                <div class="bar-label">LINE 03</div>
+            </div>
+        </div>
+
+        <!-- Legend -->
+        <div style="display:flex; gap:16px; margin-top:14px; justify-content:center;">
+            <span style="font-size:0.62rem; color:var(--blue);">● Availability</span>
+            <span style="font-size:0.62rem; color:var(--orange);">● Performance</span>
+            <span style="font-size:0.62rem; color:var(--purple);">● Quality</span>
+            <span style="font-size:0.62rem; color:var(--green);">● OEE</span>
+        </div>
+    </div>
+
+    <!-- OEE Trend (simplified SVG) -->
+    <div class="card">
+        <div class="label label-cyan" style="margin-bottom:14px;">OEE trend — 30 day</div>
+        <svg viewBox="0 0 400 160" width="100%" height="160" style="overflow:visible;">
+            <!-- Grid lines -->
+            <line x1="0" y1="24" x2="400" y2="24" stroke="rgba(255,255,255,0.04)" stroke-width="1"/>
+            <line x1="0" y1="56" x2="400" y2="56" stroke="rgba(255,255,255,0.04)" stroke-width="1"/>
+            <line x1="0" y1="88" x2="400" y2="88" stroke="rgba(255,255,255,0.04)" stroke-width="1"/>
+            <line x1="0" y1="120" x2="400" y2="120" stroke="rgba(255,255,255,0.04)" stroke-width="1"/>
+
+            <!-- 85% target line -->
+            <line x1="0" y1="24" x2="400" y2="24" stroke="var(--green)" stroke-width="1"
+                  stroke-dasharray="6,4" opacity="0.5"/>
+            <text x="405" y="28" fill="var(--green)" font-size="8" opacity="0.6">85%</text>
+
+            <!-- Y axis labels -->
+            <text x="-4" y="28" fill="var(--text-muted)" font-size="7" text-anchor="end">85</text>
+            <text x="-4" y="60" fill="var(--text-muted)" font-size="7" text-anchor="end">75</text>
+            <text x="-4" y="92" fill="var(--text-muted)" font-size="7" text-anchor="end">65</text>
+            <text x="-4" y="124" fill="var(--text-muted)" font-size="7" text-anchor="end">55</text>
+
+            <!-- LINE 01 (blue) — fluctuating around 63-65 -->
+            <polyline fill="none" stroke="var(--blue)" stroke-width="2" opacity="0.8"
+                points="0,92 30,89 60,94 90,91 120,88 150,93 180,90 210,95 240,91 270,87 300,92 330,89 360,91 400,88"/>
+            
+            <!-- LINE 02 (orange) — fluctuating around 62-65 -->
+            <polyline fill="none" stroke="var(--orange)" stroke-width="2" opacity="0.8"
+                points="0,95 30,92 60,97 90,94 120,91 150,96 180,93 210,98 240,94 270,90 300,95 330,92 360,94 400,92"/>
+            
+            <!-- LINE 03 (green) — fluctuating around 65-68 -->
+            <polyline fill="none" stroke="var(--green)" stroke-width="2" opacity="0.8"
+                points="0,86 30,83 60,88 90,85 120,82 150,87 180,84 210,89 240,85 270,81 300,85 330,82 360,84 400,80"/>
+
+            <!-- Plant avg (cyan dashed) -->
+            <polyline fill="none" stroke="var(--cyan)" stroke-width="2" stroke-dasharray="6,4" opacity="0.6"
+                points="0,91 30,88 60,93 90,90 120,87 150,92 180,89 210,94 240,90 270,86 300,91 330,88 360,90 400,87"/>
+
+            <!-- X axis labels -->
+            <text x="0" y="145" fill="var(--text-muted)" font-size="7">Sep 1</text>
+            <text x="130" y="145" fill="var(--text-muted)" font-size="7">Sep 5</text>
+            <text x="260" y="145" fill="var(--text-muted)" font-size="7">Sep 10</text>
+            <text x="380" y="145" fill="var(--text-muted)" font-size="7">Sep 15</text>
+        </svg>
+        <div style="display:flex; gap:16px; margin-top:8px; justify-content:center;">
+            <span style="font-size:0.62rem; color:var(--blue);">● Line 01</span>
+            <span style="font-size:0.62rem; color:var(--orange);">● Line 02</span>
+            <span style="font-size:0.62rem; color:var(--green);">● Line 03</span>
+            <span style="font-size:0.62rem; color:var(--cyan);">┈ Plant avg</span>
+        </div>
+    </div>
+</div>
+
+
+<!-- ════════════════════════════════════════════════════════════
+     SECTION 6: Maintenance Cost by Asset
+     ════════════════════════════════════════════════════════════ -->
+<div class="section-header">
+    <span class="icon">💰</span>
+    <span class="title">Maintenance cost by asset</span>
+</div>
+
+<div class="card">
+    <div style="display:flex; flex-direction:column; gap:8px;">
+        <!-- Motor M1 -->
+        <div style="display:flex; align-items:center; gap:12px;">
+            <span style="width:110px; font-size:0.75rem; color:var(--text-primary);">Motor M1</span>
+            <span class="badge badge-orange" style="width:60px; text-align:center;">Warning</span>
+            <div class="hbar-track" style="flex:1;">
+                <div class="hbar-fill" style="width:100%; background:var(--orange); box-shadow:0 0 6px rgba(245,158,11,0.4);"></div>
+            </div>
+            <span style="width:60px; text-align:right; font-size:0.78rem; font-weight:600; color:var(--orange);">$1,300</span>
+        </div>
+        <!-- Pump P2 -->
+        <div style="display:flex; align-items:center; gap:12px;">
+            <span style="width:110px; font-size:0.75rem; color:var(--text-primary);">Pump P2</span>
+            <span class="badge badge-orange" style="width:60px; text-align:center;">Warning</span>
+            <div class="hbar-track" style="flex:1;">
+                <div class="hbar-fill" style="width:100%; background:var(--orange); box-shadow:0 0 6px rgba(245,158,11,0.4);"></div>
+            </div>
+            <span style="width:60px; text-align:right; font-size:0.78rem; font-weight:600; color:var(--orange);">$1,300</span>
+        </div>
+        <!-- Compressor A1 -->
+        <div style="display:flex; align-items:center; gap:12px;">
+            <span style="width:110px; font-size:0.75rem; color:var(--text-primary);">Compressor A1</span>
+            <span class="badge badge-orange" style="width:60px; text-align:center;">Warning</span>
+            <div class="hbar-track" style="flex:1;">
+                <div class="hbar-fill" style="width:85%; background:var(--orange); box-shadow:0 0 6px rgba(245,158,11,0.4);"></div>
+            </div>
+            <span style="width:60px; text-align:right; font-size:0.78rem; font-weight:600; color:var(--orange);">$1,100</span>
+        </div>
+        <!-- Conveyor C1 -->
+        <div style="display:flex; align-items:center; gap:12px;">
+            <span style="width:110px; font-size:0.75rem; color:var(--text-primary);">Conveyor C1</span>
+            <span class="badge badge-orange" style="width:60px; text-align:center;">Warning</span>
+            <div class="hbar-track" style="flex:1;">
+                <div class="hbar-fill" style="width:85%; background:var(--orange); box-shadow:0 0 6px rgba(245,158,11,0.4);"></div>
+            </div>
+            <span style="width:60px; text-align:right; font-size:0.78rem; font-weight:600; color:var(--orange);">$1,100</span>
+        </div>
+        <!-- Compressor A2 -->
+        <div style="display:flex; align-items:center; gap:12px;">
+            <span style="width:110px; font-size:0.75rem; color:var(--text-primary);">Compressor A2</span>
+            <span class="badge badge-orange" style="width:60px; text-align:center;">Warning</span>
+            <div class="hbar-track" style="flex:1;">
+                <div class="hbar-fill" style="width:69%; background:var(--orange); box-shadow:0 0 6px rgba(245,158,11,0.4);"></div>
+            </div>
+            <span style="width:60px; text-align:right; font-size:0.78rem; font-weight:600; color:var(--orange);">$900</span>
+        </div>
+    </div>
+</div>
+
+
+<!-- ════════════════════════════════════════════════════════════
+     SECTION 7: Asset Risk Matrix
+     ════════════════════════════════════════════════════════════ -->
+<div class="section-header">
+    <span class="icon">⚠️</span>
+    <span class="title">Asset risk matrix</span>
+</div>
+
+<div class="card" style="padding:0; overflow:hidden;">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Asset</th>
+                <th>Stage</th>
+                <th>Failure mode</th>
+                <th>RUL (h)</th>
+                <th>Failure $</th>
+                <th>Repair $</th>
+                <th>Inaction $</th>
+                <th>Parts</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td style="font-weight:600;">Compressor A1</td>
+                <td><span class="badge badge-orange">Warning</span></td>
+                <td>Imbalance</td>
+                <td style="color:var(--red); font-weight:700;">48.1</td>
+                <td>$11,093</td>
+                <td style="color:var(--green);">$2,031</td>
+                <td style="color:var(--red); font-weight:600;">$9,062</td>
+                <td><span class="badge badge-red">ORDER NEEDED</span></td>
+            </tr>
+            <tr>
+                <td style="font-weight:600;">Conveyor C1</td>
+                <td><span class="badge badge-orange">Warning</span></td>
+                <td>Normal</td>
+                <td style="color:var(--orange); font-weight:700;">67.1</td>
+                <td>$4,412</td>
+                <td style="color:var(--green);">$1,049</td>
+                <td style="color:var(--orange); font-weight:600;">$3,363</td>
+                <td><span class="badge badge-green">IN STOCK</span></td>
+            </tr>
+            <tr>
+                <td style="font-weight:600;">Compressor A2</td>
+                <td><span class="badge badge-orange">Warning</span></td>
+                <td>Imbalance</td>
+                <td style="color:var(--orange); font-weight:700;">115.1</td>
+                <td>$9,420</td>
+                <td style="color:var(--green);">$1,816</td>
+                <td style="color:var(--red); font-weight:600;">$7,604</td>
+                <td><span class="badge badge-red">ORDER NEEDED</span></td>
+            </tr>
+            <tr>
+                <td style="font-weight:600;">Pump P2</td>
+                <td><span class="badge badge-orange">Warning</span></td>
+                <td>Normal</td>
+                <td>369.0</td>
+                <td>$3,547</td>
+                <td style="color:var(--green);">$1,213</td>
+                <td>$2,334</td>
+                <td><span class="badge badge-green">IN STOCK</span></td>
+            </tr>
+            <tr>
+                <td style="font-weight:600;">Fan F1</td>
+                <td><span class="badge badge-orange">Warning</span></td>
+                <td>Normal</td>
+                <td>488.0</td>
+                <td>$1,853</td>
+                <td style="color:var(--green);">$662</td>
+                <td>$1,191</td>
+                <td><span class="badge badge-green">IN STOCK</span></td>
+            </tr>
+            <tr>
+                <td style="font-weight:600;">Turbine T1</td>
+                <td><span class="badge badge-green">Healthy</span></td>
+                <td>Normal</td>
+                <td style="color:var(--green);">2,000</td>
+                <td>$10,233</td>
+                <td style="color:var(--green);">$3,628</td>
+                <td>$6,605</td>
+                <td><span class="badge badge-green">IN STOCK</span></td>
+            </tr>
+            <tr>
+                <td style="font-weight:600;">Motor M1</td>
+                <td><span class="badge badge-orange">Warning</span></td>
+                <td>Normal</td>
+                <td style="color:var(--green);">2,000</td>
+                <td>$2,702</td>
+                <td style="color:var(--green);">$917</td>
+                <td>$1,785</td>
+                <td><span class="badge badge-green">IN STOCK</span></td>
+            </tr>
+        </tbody>
+    </table>
+</div>
+
+
+<!-- ════════════════════════════════════════════════════════════
+     SECTION 8: WO Cost Breakdown + Donut
+     ════════════════════════════════════════════════════════════ -->
+<div class="section-header">
+    <span class="icon">📋</span>
+    <span class="title">Work order cost breakdown</span>
+</div>
+
+<div class="grid grid-2">
+    <div class="grid grid-3">
+        <div class="card" style="text-align:center;">
+            <div class="label" style="margin-bottom:6px;">Open WOs</div>
+            <div class="value-lg text-cyan">3</div>
+        </div>
+        <div class="card" style="text-align:center;">
+            <div class="label" style="margin-bottom:6px;">Emergency</div>
+            <div class="value-lg text-red">2</div>
+        </div>
+        <div class="card" style="text-align:center;">
+            <div class="label" style="margin-bottom:6px;">Total spend</div>
+            <div class="value-lg text-orange">$3,100</div>
+        </div>
+    </div>
+    <div class="card" style="text-align:center;">
+        <div class="label label-cyan" style="margin-bottom:10px;">Spend by WO type</div>
+        <!-- CSS Donut -->
+        <div class="donut" style="background: conic-gradient(
+            var(--orange) 0deg 231deg,
+            var(--green) 231deg 360deg
+        ); filter: drop-shadow(0 0 10px rgba(245,158,11,0.2));">
+            <div class="donut-center" style="width:80px; height:80px; background:var(--bg-secondary);
+                        border-radius:50%; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+                <div style="font-size:1rem; font-weight:700; color:var(--text-primary);">$3,100</div>
+                <div style="font-size:0.6rem; color:var(--text-muted);">Total</div>
+            </div>
+        </div>
+        <div style="display:flex; gap:16px; justify-content:center; margin-top:10px;">
+            <span style="font-size:0.65rem; color:var(--orange);">● Corrective $2,200</span>
+            <span style="font-size:0.65rem; color:var(--green);">● Preventive $900</span>
+        </div>
+    </div>
+</div>
+
+
+<!-- ════════════════════════════════════════════════════════════
+     SECTION 9: Supply Chain Risk Overview
+     ════════════════════════════════════════════════════════════ -->
+<div class="section-header">
+    <span class="icon">🔗</span>
+    <span class="title">Supply chain risk overview</span>
+</div>
+
+<div class="grid grid-5" style="margin-bottom:12px;">
+    <div class="card card-glow-red" style="text-align:center;">
+        <div class="label label-red" style="margin-bottom:4px;">Critical shortage</div>
+        <div class="value-lg text-red">3</div>
+    </div>
+    <div class="card card-glow-orange" style="text-align:center;">
+        <div class="label label-orange" style="margin-bottom:4px;">Expedite needed</div>
+        <div class="value-lg text-orange">1</div>
+    </div>
+    <div class="card" style="text-align:center;">
+        <div class="label" style="margin-bottom:4px;">Replenish now</div>
+        <div class="value-lg text-cyan">4</div>
+    </div>
+    <div class="card" style="text-align:center;">
+        <div class="label" style="margin-bottom:4px;">Reserved</div>
+        <div class="value-lg text-green">2</div>
+    </div>
+    <div class="card" style="text-align:center;">
+        <div class="label" style="margin-bottom:4px;">Open POs</div>
+        <div class="value-lg text-purple">—</div>
+    </div>
+</div>
+
+<div class="card" style="padding:0; overflow:hidden;">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Asset</th>
+                <th>Part</th>
+                <th>Risk</th>
+                <th>Lead (d)</th>
+                <th>Gap (d)</th>
+                <th>ATP</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td style="font-weight:600;">Compressor A1</td>
+                <td>Shaft Sleeve</td>
+                <td><span class="badge badge-red">CRITICAL SHORTAGE</span></td>
+                <td>12</td>
+                <td style="color:var(--red); font-weight:700;">9</td>
+                <td>0</td>
+                <td style="color:var(--red);">Escalate</td>
+            </tr>
+            <tr>
+                <td style="font-weight:600;">Compressor A1</td>
+                <td>V-Belt Kit</td>
+                <td><span class="badge badge-red">CRITICAL SHORTAGE</span></td>
+                <td>4</td>
+                <td style="color:var(--red); font-weight:700;">1</td>
+                <td>4</td>
+                <td style="color:var(--red);">Escalate</td>
+            </tr>
+            <tr>
+                <td style="font-weight:600;">Compressor A2</td>
+                <td>Vibratory Seal Kit</td>
+                <td><span class="badge badge-red">CRITICAL SHORTAGE</span></td>
+                <td>3</td>
+                <td style="color:var(--orange); font-weight:700;">-2</td>
+                <td>2</td>
+                <td>Monitor PO</td>
+            </tr>
+            <tr>
+                <td style="font-weight:600;">Compressor A2</td>
+                <td>Bearing 6205-2RS</td>
+                <td><span class="badge badge-orange">EXPEDITE</span></td>
+                <td>5</td>
+                <td>0</td>
+                <td>7</td>
+                <td style="color:var(--orange);">Create PO</td>
+            </tr>
+            <tr>
+                <td style="font-weight:600;">Compressor A1</td>
+                <td>Bearing 6205-2RS</td>
+                <td><span class="badge badge-blue">REPLENISH NOW</span></td>
+                <td>5</td>
+                <td>2</td>
+                <td>7</td>
+                <td>Reserve &amp; reorder</td>
+            </tr>
+            <tr>
+                <td style="font-weight:600;">Conveyor C1</td>
+                <td>Bearing 6310-2RS</td>
+                <td><span class="badge badge-blue">REPLENISH NOW</span></td>
+                <td>7</td>
+                <td>4</td>
+                <td>3</td>
+                <td>Reserve &amp; reorder</td>
+            </tr>
+        </tbody>
+    </table>
+</div>
+
+
+<!-- ════════════════════════════════════════════════════════════
+     SECTION 10: Footer / Watermark
+     ════════════════════════════════════════════════════════════ -->
+<div class="watermark">
+    <div style="font-size:0.7rem; color:var(--text-muted); margin-bottom:4px;">
+        MFGPulse AI — Executive Dashboard Design Preview
+    </div>
+    <div style="font-size:0.62rem; color:var(--text-muted);">
+        10 Assets · 3 Production Lines · 172K+ Sensor Readings · 13 Dynamic Tables · 100% Snowflake-native
+    </div>
+    <div style="font-size:0.58rem; color:rgba(100,116,139,0.5); margin-top:8px;">
+        Generated for stakeholder review — September 2026
+    </div>
+</div>
+
+</body>
+</html>

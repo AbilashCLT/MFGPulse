@@ -1,0 +1,4833 @@
+create or replace database MFGPULSE_DB;
+
+create or replace schema AGENT;
+
+create or replace schema ANALYTICS;
+
+create or replace dynamic table ACTIVE_ALERTS(
+	ALERT_ID,
+	ASSET_ID,
+	ASSET_NAME,
+	ASSET_TYPE,
+	LINE_ID,
+	CREATED_AT,
+	SEVERITY,
+	ALERT_TYPE,
+	MESSAGE,
+	FAILURE_MODE_PRED,
+	FAILURE_MODE_CONFIDENCE,
+	RUL_HOURS,
+	RUL_LOWER_CI,
+	RUL_UPPER_CI,
+	STAGE_PRED,
+	DEGRADATION_SCORE,
+	TRANSITION_PROBABILITY,
+	FATIGUE_SCORE,
+	COMPOSITE_HEALTH_SCORE,
+	WO_COUNT_90D,
+	IS_CHRONIC,
+	ESCALATION_AT,
+	ACKNOWLEDGED,
+	RESOLVED
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH alert_history AS (
+    -- Count recent work orders per asset (chronic issue indicator)
+    SELECT asset_id, COUNT(*) AS wo_count_90d
+    FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS
+    WHERE created_date >= DATEADD('day', -90, CURRENT_TIMESTAMP())
+    GROUP BY asset_id
+),
+predictions AS (
+    SELECT lp.*, COALESCE(ah.wo_count_90d, 0) AS wo_count_90d
+    FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS lp
+    LEFT JOIN alert_history ah ON lp.asset_id = ah.asset_id
+)
+SELECT 
+    asset_id || '-' || TO_CHAR(prediction_time, 'YYYYMMDD') || '-' || 
+        CASE 
+            WHEN stage_pred = 'Critical' AND (rul_hours < 24 OR fatigue_score > 0.85) THEN 'CRIT'
+            WHEN stage_pred = 'Critical' OR rul_hours < 72 OR fatigue_score > 0.7 THEN 'WARN'
+            WHEN stage_pred = 'Warning' OR fatigue_score > 0.4 THEN 'WATCH'
+            ELSE 'INFO'
+        END AS alert_id,
+    asset_id,
+    asset_name,
+    asset_type,
+    line_id,
+    prediction_time AS created_at,
+    
+    -- Severity (multi-signal logic)
+    CASE 
+        WHEN stage_pred = 'Critical' AND (rul_hours < 24 OR fatigue_score > 0.85) THEN 'CRITICAL'
+        WHEN stage_pred = 'Critical' OR rul_hours < 72 OR fatigue_score > 0.7 THEN 'WARNING'
+        WHEN stage_pred = 'Warning' OR fatigue_score > 0.4 THEN 'WATCH'
+        WHEN fatigue_score > 0.2 AND stage_pred = 'Healthy' THEN 'INFO'
+        ELSE NULL  -- no alert
+    END AS severity,
+    
+    -- Alert type
+    CASE 
+        WHEN failure_mode_pred != 'normal' THEN 'FAILURE_PREDICTION'
+        WHEN fatigue_score > 0.4 AND stage_pred = 'Healthy' THEN 'HIDDEN_FATIGUE'
+        WHEN rul_hours < 72 THEN 'LOW_RUL'
+        ELSE 'DEGRADATION'
+    END AS alert_type,
+    
+    -- Context-rich message
+    CONCAT(
+        asset_name, ': ',
+        CASE failure_mode_pred 
+            WHEN 'normal' THEN 'Degradation detected'
+            ELSE INITCAP(REPLACE(failure_mode_pred, '_', ' ')) || ' detected'
+        END,
+        '. RUL: ', ROUND(rul_hours, 0)::VARCHAR, 'hrs',
+        '. Fatigue: ', ROUND(fatigue_score, 2)::VARCHAR,
+        '. Stage: ', stage_pred,
+        CASE WHEN wo_count_90d > 2 THEN '. CHRONIC: ' || wo_count_90d::VARCHAR || ' work orders in 90 days' ELSE '' END,
+        '.'
+    ) AS message,
+    
+    -- Model outputs for drill-down
+    failure_mode_pred,
+    failure_mode_confidence,
+    rul_hours,
+    rul_lower_ci,
+    rul_upper_ci,
+    stage_pred,
+    degradation_score,
+    transition_probability,
+    fatigue_score,
+    composite_health_score,
+    
+    -- Chronic issue flag
+    wo_count_90d,
+    CASE WHEN wo_count_90d > 2 THEN TRUE ELSE FALSE END AS is_chronic,
+    
+    -- Escalation timestamp (when this alert would auto-escalate)
+    CASE 
+        WHEN stage_pred = 'Critical' AND (rul_hours < 24 OR fatigue_score > 0.85) THEN NULL  -- already max
+        WHEN stage_pred = 'Critical' OR rul_hours < 72 THEN DATEADD('hour', 12, prediction_time)  -- escalate in 12hrs
+        WHEN stage_pred = 'Warning' OR fatigue_score > 0.4 THEN DATEADD('hour', 24, prediction_time)  -- escalate in 24hrs
+        ELSE NULL
+    END AS escalation_at,
+    
+    FALSE AS acknowledged,
+    FALSE AS resolved
+
+FROM predictions
+WHERE stage_pred != 'Healthy' OR fatigue_score > 0.2;
+create or replace TABLE ALERT_HISTORY (
+	ALERT_ID VARCHAR(16777216),
+	ASSET_ID VARCHAR(20),
+	ASSET_NAME VARCHAR(100),
+	SEVERITY VARCHAR(10),
+	ALERT_TYPE VARCHAR(20),
+	MESSAGE VARCHAR(16777216),
+	RUL_HOURS FLOAT,
+	FAILURE_MODE_PRED VARCHAR(50),
+	FATIGUE_SCORE FLOAT,
+	CREATED_AT TIMESTAMP_NTZ(9),
+	ARCHIVED_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP()
+);
+create or replace TABLE KPI_SNAPSHOTS (
+	SNAPSHOT_DATE DATE NOT NULL,
+	PLANT_OEE FLOAT,
+	CRITICAL_ASSETS NUMBER(38,0),
+	WARNING_ASSETS NUMBER(38,0),
+	HEALTHY_ASSETS NUMBER(38,0),
+	TOTAL_COST_AVOIDED FLOAT,
+	DOWNTIME_HOURS_PREVENTED FLOAT,
+	MAINTENANCE_ROI_X FLOAT,
+	TOTAL_ALERTS NUMBER(38,0),
+	CRITICAL_ALERTS NUMBER(38,0),
+	AVG_EARLY_DETECTION_DAYS FLOAT,
+	TOTAL_MAINTENANCE_SPEND FLOAT,
+	SNAPSHOT_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP()
+);
+create or replace dynamic table OEE_METRICS(
+	ASSET_ID,
+	ASSET_NAME,
+	LINE_ID,
+	SHIFT_ID,
+	SHIFT_DATE,
+	SHIFT_TIME,
+	AVAILABILITY_PCT,
+	PERFORMANCE_PCT,
+	QUALITY_PCT,
+	OEE_PCT,
+	AVAILABILITY_LOSS_PCT,
+	PERFORMANCE_LOSS_PCT,
+	QUALITY_LOSS_PCT,
+	LOSS_ATTRIBUTED_TO,
+	STAGE_PRED,
+	FAILURE_MODE_PRED,
+	RUL_HOURS,
+	UNITS_PRODUCED,
+	GOOD_UNITS
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH shift_production AS (
+    SELECT 
+        po.asset_id,
+        am.asset_name,
+        am.line_id,
+        po.shift_id,
+        po.timestamp AS shift_time,
+        DATE_TRUNC('day', po.timestamp) AS shift_date,
+        po.units_produced,
+        po.good_units,
+        -- Max production per shift (based on historical max for this asset)
+        MAX(po.units_produced) OVER (PARTITION BY po.asset_id) AS max_units_per_shift,
+        COALESCE(lp.stage_pred, 'Healthy') AS stage_pred,
+        COALESCE(lp.failure_mode_pred, 'normal') AS failure_mode_pred,
+        COALESCE(lp.rul_hours, 2000) AS rul_hours
+    FROM MFGPULSE_DB.RAW_IT.PRODUCTION_OUTPUT po
+    JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON po.asset_id = am.asset_id
+    LEFT JOIN MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS lp ON po.asset_id = lp.asset_id
+)
+SELECT 
+    asset_id,
+    asset_name,
+    line_id,
+    shift_id,
+    shift_date,
+    shift_time,
+    
+    -- Availability: degradation reduces run time
+    ROUND(GREATEST(30, 100 - 5 - 
+        CASE WHEN stage_pred = 'Critical' THEN 15
+             WHEN stage_pred = 'Warning' THEN 5
+             ELSE 0 END
+    ), 1) AS availability_pct,
+    
+    -- Performance: actual vs max capacity for this asset
+    ROUND(LEAST(100, units_produced * 100.0 / NULLIF(max_units_per_shift, 0)), 1) AS performance_pct,
+    
+    -- Quality: good units / total units
+    ROUND(LEAST(100, good_units * 100.0 / NULLIF(units_produced, 0)), 1) AS quality_pct,
+    
+    -- OEE = A × P × Q
+    ROUND(GREATEST(30, 100 - 5 - CASE WHEN stage_pred = 'Critical' THEN 15 WHEN stage_pred = 'Warning' THEN 5 ELSE 0 END)
+        * LEAST(100, units_produced * 100.0 / NULLIF(max_units_per_shift, 0))
+        * LEAST(100, good_units * 100.0 / NULLIF(units_produced, 0))
+        / 10000, 1) AS oee_pct,
+    
+    -- Loss breakdown
+    ROUND(5 + CASE WHEN stage_pred = 'Critical' THEN 15 WHEN stage_pred = 'Warning' THEN 5 ELSE 0 END, 1) AS availability_loss_pct,
+    ROUND(100 - LEAST(100, units_produced * 100.0 / NULLIF(max_units_per_shift, 0)), 1) AS performance_loss_pct,
+    ROUND(100 - LEAST(100, good_units * 100.0 / NULLIF(units_produced, 0)), 1) AS quality_loss_pct,
+    
+    -- Loss attribution
+    CASE 
+        WHEN stage_pred = 'Critical' THEN 
+            asset_name || ': ' || REPLACE(failure_mode_pred, '_', ' ') || ' reducing availability by 15%'
+        WHEN stage_pred = 'Warning' THEN
+            asset_name || ': degradation impacting performance by 5%'
+        ELSE NULL
+    END AS loss_attributed_to,
+    
+    stage_pred, failure_mode_pred, rul_hours, units_produced, good_units
+    
+FROM shift_production;
+create or replace TABLE SHIFT_HANDOVER_HISTORY (
+	GENERATED_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+	SUMMARY_TEXT VARCHAR(16777216),
+	WOS_GENERATED NUMBER(38,0),
+	PLANT_OEE FLOAT,
+	CRITICAL_ASSETS NUMBER(38,0)
+);
+create or replace view ALERT_SUMMARY(
+	CRITICAL_COUNT,
+	WARNING_COUNT,
+	WATCH_COUNT,
+	INFO_COUNT,
+	TOTAL_ALERTS
+) as
+SELECT 
+    COUNT(CASE WHEN SEVERITY = 'CRITICAL' THEN 1 END) AS critical_count,
+    COUNT(CASE WHEN SEVERITY = 'WARNING' THEN 1 END) AS warning_count,
+    COUNT(CASE WHEN SEVERITY = 'WATCH' THEN 1 END) AS watch_count,
+    COUNT(CASE WHEN SEVERITY = 'INFO' THEN 1 END) AS info_count,
+    COUNT(*) AS total_alerts
+FROM MFGPULSE_DB.ANALYTICS.ACTIVE_ALERTS;
+create or replace view COST_IMPACT(
+	ASSETS_WITH_EARLY_DETECTION,
+	AVG_EARLY_DETECTION_DAYS,
+	MAX_EARLY_DETECTION_DAYS,
+	TOTAL_COST_AVOIDED,
+	DOWNTIME_HOURS_PREVENTED,
+	AVG_COST_PER_EMERGENCY_FAILURE,
+	AVG_COST_PER_PLANNED_REPAIR,
+	COST_MULTIPLIER_IF_UNDETECTED,
+	MAINTENANCE_ROI_X,
+	CURRENT_PLANT_OEE,
+	TARGET_OEE,
+	OEE_IMPROVEMENT_POTENTIAL,
+	TOTAL_ASSETS_MONITORED,
+	ACTIVE_CRITICAL_WARNINGS
+) as
+WITH early_detections AS (
+    SELECT 
+        fs.asset_id, am.asset_name,
+        MIN(fs.timestamp) AS fatigue_first_warning,
+        MIN(CASE WHEN sr.vibration_mag > 7.1 THEN sr.timestamp END) AS threshold_first_alert,
+        MIN(wo.created_date) AS first_failure_date,
+        AVG(CASE WHEN wo.wo_type = 'emergency' THEN wo.total_cost END) AS avg_emergency_cost,
+        AVG(CASE WHEN wo.wo_type = 'corrective' THEN wo.total_cost END) AS avg_corrective_cost
+    FROM MFGPULSE_DB.ML_MODELS.FATIGUE_SCORES fs
+    JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON fs.asset_id = am.asset_id
+    LEFT JOIN (
+        SELECT asset_id, timestamp, 
+            SQRT(POWER(vibration_x,2)+POWER(vibration_y,2)+POWER(vibration_z,2)) AS vibration_mag
+        FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS
+    ) sr ON fs.asset_id = sr.asset_id
+    LEFT JOIN MFGPULSE_DB.RAW_IT.WORK_ORDERS wo ON fs.asset_id = wo.asset_id 
+        AND wo.wo_type IN ('emergency', 'corrective')
+    WHERE fs.fatigue_score > 0.4
+    GROUP BY fs.asset_id, am.asset_name
+),
+detection_metrics AS (
+    SELECT 
+        asset_id, asset_name, fatigue_first_warning, threshold_first_alert, first_failure_date,
+        GREATEST(0, DATEDIFF('day', fatigue_first_warning, threshold_first_alert)) AS days_early_vs_threshold,
+        GREATEST(0, DATEDIFF('day', fatigue_first_warning, first_failure_date)) AS days_before_failure,
+        COALESCE(avg_emergency_cost, 12000) AS emergency_cost,
+        COALESCE(avg_corrective_cost, 2000) AS planned_repair_cost,
+        COALESCE(avg_emergency_cost, 12000) - COALESCE(avg_corrective_cost, 2000) AS cost_avoided_per_event
+    FROM early_detections
+    WHERE threshold_first_alert IS NOT NULL
+      AND fatigue_first_warning < COALESCE(first_failure_date, CURRENT_TIMESTAMP())
+),
+plant_oee AS (
+    SELECT 
+        ROUND(AVG(oee_pct), 1) AS current_plant_oee,
+        ROUND(AVG(CASE WHEN stage_pred = 'Healthy' THEN oee_pct END), 1) AS healthy_asset_oee
+    FROM MFGPULSE_DB.ANALYTICS.OEE_METRICS
+),
+summary AS (
+    SELECT 
+        COUNT(DISTINCT asset_id) AS assets_with_early_detection,
+        ROUND(AVG(days_early_vs_threshold), 0) AS avg_days_early,
+        ROUND(MAX(days_early_vs_threshold), 0) AS max_days_early,
+        ROUND(SUM(cost_avoided_per_event), 0) AS total_cost_avoided,
+        ROUND(AVG(emergency_cost), 0) AS avg_emergency_cost,
+        ROUND(AVG(planned_repair_cost), 0) AS avg_planned_cost,
+        ROUND(SUM(days_before_failure) * 8, 0) AS downtime_hours_prevented
+    FROM detection_metrics
+)
+SELECT 
+    s.assets_with_early_detection,
+    s.avg_days_early AS avg_early_detection_days,
+    s.max_days_early AS max_early_detection_days,
+    s.total_cost_avoided,
+    s.downtime_hours_prevented,
+    s.avg_emergency_cost AS avg_cost_per_emergency_failure,
+    s.avg_planned_cost AS avg_cost_per_planned_repair,
+    ROUND(s.avg_emergency_cost / NULLIF(s.avg_planned_cost, 0), 1) AS cost_multiplier_if_undetected,
+    ROUND(s.total_cost_avoided / NULLIF(s.avg_planned_cost * s.assets_with_early_detection, 0), 1) AS maintenance_roi_x,
+    po.current_plant_oee,
+    COALESCE(po.healthy_asset_oee, 85.0) AS target_oee,
+    ROUND(COALESCE(po.healthy_asset_oee, 85.0) - po.current_plant_oee, 1) AS oee_improvement_potential,
+    (SELECT COUNT(*) FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER) AS total_assets_monitored,
+    (SELECT COUNT(*) FROM MFGPULSE_DB.ANALYTICS.ACTIVE_ALERTS WHERE severity IN ('CRITICAL','WARNING')) AS active_critical_warnings
+FROM summary s
+CROSS JOIN plant_oee po;
+create or replace view COST_IMPACT_BY_ASSET(
+	ASSET_ID,
+	ASSET_NAME,
+	EMERGENCY_COUNT,
+	CORRECTIVE_COUNT,
+	EMERGENCY_COST,
+	CORRECTIVE_COST,
+	PREVENTIVE_COST,
+	TOTAL_COST,
+	STAGE_PRED,
+	RUL_HOURS,
+	FATIGUE_SCORE,
+	POTENTIAL_SAVINGS_IF_DETECTED_EARLY
+) as
+WITH asset_costs AS (
+    SELECT 
+        wo.asset_id,
+        am.asset_name,
+        COUNT(CASE WHEN wo.wo_type = 'emergency' THEN 1 END) AS emergency_count,
+        COUNT(CASE WHEN wo.wo_type = 'corrective' THEN 1 END) AS corrective_count,
+        COALESCE(SUM(CASE WHEN wo.wo_type = 'emergency' THEN wo.total_cost END), 0) AS emergency_cost,
+        COALESCE(SUM(CASE WHEN wo.wo_type = 'corrective' THEN wo.total_cost END), 0) AS corrective_cost,
+        COALESCE(SUM(CASE WHEN wo.wo_type = 'preventive' THEN wo.total_cost END), 0) AS preventive_cost,
+        COALESCE(SUM(wo.total_cost), 0) AS total_cost
+    FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS wo
+    JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON wo.asset_id = am.asset_id
+    WHERE wo.total_cost IS NOT NULL
+    GROUP BY wo.asset_id, am.asset_name
+)
+SELECT 
+    ac.*,
+    lp.stage_pred,
+    lp.rul_hours,
+    lp.fatigue_score,
+    CASE WHEN lp.stage_pred = 'Critical' AND ac.emergency_count > 0
+        THEN ROUND(ac.emergency_cost - ac.corrective_cost, 0) 
+        ELSE 0 
+    END AS potential_savings_if_detected_early
+FROM asset_costs ac
+LEFT JOIN MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS lp ON ac.asset_id = lp.asset_id
+ORDER BY total_cost DESC;
+create or replace view DATA_FRESHNESS_SLA(
+	SOURCE_TABLE,
+	LAST_DATA_TIMESTAMP,
+	CHECKED_AT,
+	STALENESS_MINUTES,
+	SLA_THRESHOLD_MINUTES,
+	FRESHNESS_STATUS
+) as
+SELECT 
+    'SENSOR_READINGS' AS source_table,
+    MAX(TIMESTAMP) AS last_data_timestamp,
+    CURRENT_TIMESTAMP()::TIMESTAMP_NTZ AS checked_at,
+    DATEDIFF('minute', MAX(TIMESTAMP), CURRENT_TIMESTAMP()) AS staleness_minutes,
+    120 AS sla_threshold_minutes,
+    CASE 
+        WHEN DATEDIFF('minute', MAX(TIMESTAMP), CURRENT_TIMESTAMP()) < 10 THEN 'LIVE'
+        WHEN DATEDIFF('minute', MAX(TIMESTAMP), CURRENT_TIMESTAMP()) < 60 THEN 'RECENT'
+        WHEN DATEDIFF('minute', MAX(TIMESTAMP), CURRENT_TIMESTAMP()) < 120 THEN 'APPROACHING_SLA'
+        ELSE 'SLA_BREACH'
+    END AS freshness_status
+FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS
+UNION ALL
+SELECT 
+    'MAINTENANCE_LOGS',
+    MAX(TIMESTAMP),
+    CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
+    DATEDIFF('minute', MAX(TIMESTAMP), CURRENT_TIMESTAMP()),
+    1440,
+    CASE 
+        WHEN DATEDIFF('minute', MAX(TIMESTAMP), CURRENT_TIMESTAMP()) < 1440 THEN 'LIVE'
+        ELSE 'SLA_BREACH'
+    END
+FROM MFGPULSE_DB.RAW_IT.MAINTENANCE_LOGS
+UNION ALL
+SELECT 
+    'WORK_ORDERS',
+    MAX(CREATED_DATE),
+    CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
+    DATEDIFF('minute', MAX(CREATED_DATE), CURRENT_TIMESTAMP()),
+    1440,
+    CASE 
+        WHEN DATEDIFF('minute', MAX(CREATED_DATE), CURRENT_TIMESTAMP()) < 1440 THEN 'LIVE'
+        ELSE 'SLA_BREACH'
+    END
+FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS;
+create or replace view EXECUTIVE_SUMMARY(
+	TOTAL_ASSETS,
+	CRITICAL_ASSETS,
+	WARNING_ASSETS,
+	HEALTHY_ASSETS,
+	PLANT_OEE,
+	OEE_TARGET,
+	TOTAL_COST_AVOIDED,
+	DOWNTIME_HOURS_PREVENTED,
+	MAINTENANCE_ROI_X,
+	AVG_EARLY_DETECTION_DAYS,
+	MAX_EARLY_DETECTION_DAYS,
+	AVG_COST_PER_EMERGENCY_FAILURE,
+	AVG_COST_PER_PLANNED_REPAIR,
+	COST_MULTIPLIER_IF_UNDETECTED,
+	OEE_IMPROVEMENT_POTENTIAL,
+	TOTAL_EMERGENCY_WOS,
+	TOTAL_CORRECTIVE_WOS,
+	TOTAL_PREVENTIVE_WOS,
+	TOTAL_MAINTENANCE_SPEND
+) as
+SELECT
+    (SELECT COUNT(*) FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER) AS TOTAL_ASSETS,
+    (SELECT COUNT(*) FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS WHERE STAGE_PRED = 'Critical') AS CRITICAL_ASSETS,
+    (SELECT COUNT(*) FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS WHERE STAGE_PRED = 'Warning') AS WARNING_ASSETS,
+    (SELECT COUNT(*) FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS WHERE STAGE_PRED = 'Healthy') AS HEALTHY_ASSETS,
+    (SELECT ROUND(AVG(OEE_PCT), 1) FROM MFGPULSE_DB.ANALYTICS.OEE_METRICS) AS PLANT_OEE,
+    85.0 AS OEE_TARGET,
+    ci.TOTAL_COST_AVOIDED,
+    ci.DOWNTIME_HOURS_PREVENTED,
+    ci.MAINTENANCE_ROI_X,
+    ci.AVG_EARLY_DETECTION_DAYS,
+    ci.MAX_EARLY_DETECTION_DAYS,
+    ci.AVG_COST_PER_EMERGENCY_FAILURE,
+    ci.AVG_COST_PER_PLANNED_REPAIR,
+    ci.COST_MULTIPLIER_IF_UNDETECTED,
+    ci.OEE_IMPROVEMENT_POTENTIAL,
+    (SELECT COUNT(*) FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS WHERE WO_TYPE = 'emergency' AND STATUS IN ('open', 'in_progress')) AS TOTAL_EMERGENCY_WOS,
+    (SELECT COUNT(*) FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS WHERE WO_TYPE = 'corrective' AND STATUS IN ('open', 'in_progress')) AS TOTAL_CORRECTIVE_WOS,
+    (SELECT COUNT(*) FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS WHERE WO_TYPE = 'preventive' AND STATUS IN ('open', 'in_progress')) AS TOTAL_PREVENTIVE_WOS,
+    (SELECT ROUND(SUM(TOTAL_COST), 0) FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS WHERE TOTAL_COST IS NOT NULL) AS TOTAL_MAINTENANCE_SPEND
+FROM MFGPULSE_DB.ANALYTICS.COST_IMPACT ci;
+create or replace view OEE_PERIOD_COMPARISON(
+	LINE_ID,
+	CURRENT_OEE,
+	PREVIOUS_OEE,
+	OEE_DELTA,
+	CURRENT_AVAIL,
+	AVAIL_DELTA,
+	CURRENT_PERF,
+	PERF_DELTA,
+	CURRENT_QUAL,
+	QUAL_DELTA
+) as
+WITH current_period AS (
+    SELECT LINE_ID,
+        ROUND(AVG(AVAILABILITY_PCT), 1) AS avail,
+        ROUND(AVG(PERFORMANCE_PCT), 1) AS perf,
+        ROUND(AVG(QUALITY_PCT), 1) AS qual,
+        ROUND(AVG(OEE_PCT), 1) AS oee
+    FROM MFGPULSE_DB.ANALYTICS.OEE_METRICS
+    WHERE SHIFT_DATE >= DATEADD('day', -7, CURRENT_DATE())
+    GROUP BY LINE_ID
+),
+previous_period AS (
+    SELECT LINE_ID,
+        ROUND(AVG(AVAILABILITY_PCT), 1) AS avail,
+        ROUND(AVG(PERFORMANCE_PCT), 1) AS perf,
+        ROUND(AVG(QUALITY_PCT), 1) AS qual,
+        ROUND(AVG(OEE_PCT), 1) AS oee
+    FROM MFGPULSE_DB.ANALYTICS.OEE_METRICS
+    WHERE SHIFT_DATE >= DATEADD('day', -14, CURRENT_DATE())
+      AND SHIFT_DATE < DATEADD('day', -7, CURRENT_DATE())
+    GROUP BY LINE_ID
+)
+SELECT 
+    c.LINE_ID,
+    c.oee AS current_oee, p.oee AS previous_oee,
+    ROUND(c.oee - COALESCE(p.oee, c.oee), 1) AS oee_delta,
+    c.avail AS current_avail, ROUND(c.avail - COALESCE(p.avail, c.avail), 1) AS avail_delta,
+    c.perf AS current_perf, ROUND(c.perf - COALESCE(p.perf, c.perf), 1) AS perf_delta,
+    c.qual AS current_qual, ROUND(c.qual - COALESCE(p.qual, c.qual), 1) AS qual_delta
+FROM current_period c
+LEFT JOIN previous_period p ON c.LINE_ID = p.LINE_ID;
+create or replace view PARTS_AVAILABLE_TO_PROMISE(
+	PART_ID,
+	PART_NAME,
+	QUANTITY_ON_HAND,
+	RESERVED_QUANTITY,
+	AVAILABLE_TO_PROMISE,
+	LEAD_TIME_DAYS,
+	UNIT_COST,
+	SUPPLIER_NAME,
+	INCOMING_PO_QTY
+) as
+SELECT
+    pi.PART_ID,
+    pi.PART_NAME,
+    pi.QUANTITY_ON_HAND,
+    COALESCE(r.RESERVED_QUANTITY, 0) AS RESERVED_QUANTITY,
+    GREATEST(0, pi.QUANTITY_ON_HAND - COALESCE(r.RESERVED_QUANTITY, 0)) AS AVAILABLE_TO_PROMISE,
+    pi.LEAD_TIME_DAYS,
+    pi.UNIT_COST,
+    COALESCE(ps.SUPPLIER_NAME, 'No Supplier') AS SUPPLIER_NAME,
+    COALESCE(po_incoming.INCOMING_QTY, 0) AS INCOMING_PO_QTY
+FROM MFGPULSE_DB.RAW_IT.PARTS_INVENTORY pi
+LEFT JOIN (
+    SELECT PART_ID, SUM(QUANTITY_RESERVED) AS RESERVED_QUANTITY
+    FROM MFGPULSE_DB.RAW_IT.PART_RESERVATIONS
+    WHERE STATUS = 'active'
+    GROUP BY PART_ID
+) r ON pi.PART_ID = r.PART_ID
+LEFT JOIN (
+    SELECT ps2.PART_ID, s.SUPPLIER_NAME
+    FROM MFGPULSE_DB.RAW_IT.PART_SUPPLIERS ps2
+    JOIN MFGPULSE_DB.RAW_IT.SUPPLIERS s ON ps2.SUPPLIER_ID = s.SUPPLIER_ID
+    WHERE ps2.PREFERRED_SUPPLIER = TRUE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY ps2.PART_ID ORDER BY ps2.UNIT_COST) = 1
+) ps ON pi.PART_ID = ps.PART_ID
+LEFT JOIN (
+    SELECT pol.PART_ID, SUM(pol.QUANTITY_ORDERED) AS INCOMING_QTY
+    FROM MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES pol
+    JOIN MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS po ON pol.PO_ID = po.PO_ID
+    WHERE po.STATUS IN ('approved','ordered','shipped')
+    GROUP BY pol.PART_ID
+) po_incoming ON pi.PART_ID = po_incoming.PART_ID;
+create or replace view PARTS_LIFECYCLE_INSIGHTS(
+	PART_ID,
+	PART_NAME,
+	QUANTITY_ON_HAND,
+	UNIT_COST,
+	LEAD_TIME_DAYS,
+	TIMES_USED_IN_WOS,
+	TOTAL_WO_COST_INVOLVING_PART,
+	TOTAL_ORDERED_HISTORICALLY,
+	LAST_ORDERED_DATE,
+	ACTIVE_RESERVATIONS,
+	AVAILABLE_TO_PROMISE,
+	STOCK_STATUS,
+	COMPATIBLE_ASSET_COUNT,
+	PREFERRED_SUPPLIER,
+	AT_RISK_ASSET_COUNT,
+	AT_RISK_ASSETS,
+	INCOMING_QTY,
+	NET_POSITION,
+	BUFFER_STATUS,
+	EST_DAYS_UNTIL_STOCKOUT,
+	MIN_RUL_DAYS,
+	EARLIEST_ARRIVAL
+) as
+SELECT
+    pi.PART_ID, pi.PART_NAME, pi.QUANTITY_ON_HAND, pi.UNIT_COST, pi.LEAD_TIME_DAYS,
+    COALESCE(wo_usage.TIMES_USED, 0) AS TIMES_USED_IN_WOS,
+    COALESCE(wo_usage.TOTAL_WO_COST, 0) AS TOTAL_WO_COST_INVOLVING_PART,
+    COALESCE(po_history.TOTAL_ORDERED, 0) AS TOTAL_ORDERED_HISTORICALLY,
+    COALESCE(po_history.LAST_ORDERED_DATE, NULL) AS LAST_ORDERED_DATE,
+    COALESCE(res.ACTIVE_RESERVATIONS, 0) AS ACTIVE_RESERVATIONS,
+    COALESCE(atp.AVAILABLE_TO_PROMISE, pi.QUANTITY_ON_HAND) AS AVAILABLE_TO_PROMISE,
+    CASE
+        WHEN pi.QUANTITY_ON_HAND = 0 THEN 'OUT_OF_STOCK'
+        WHEN COALESCE(atp.AVAILABLE_TO_PROMISE, pi.QUANTITY_ON_HAND) <= 1 THEN 'LOW_STOCK'
+        WHEN pi.LEAD_TIME_DAYS > 14 THEN 'LONG_LEAD_TIME'
+        ELSE 'HEALTHY'
+    END AS STOCK_STATUS,
+    ARRAY_SIZE(pi.COMPATIBLE_ASSETS) AS COMPATIBLE_ASSET_COUNT,
+    ps.SUPPLIER_NAME AS PREFERRED_SUPPLIER,
+    COALESCE(at_risk.AT_RISK_ASSET_COUNT, 0) AS AT_RISK_ASSET_COUNT,
+    COALESCE(at_risk.AT_RISK_ASSETS, '') AS AT_RISK_ASSETS,
+    COALESCE(atp.INCOMING_PO_QTY, 0) AS INCOMING_QTY,
+    COALESCE(atp.AVAILABLE_TO_PROMISE, pi.QUANTITY_ON_HAND)
+        + COALESCE(atp.INCOMING_PO_QTY, 0)
+        - COALESCE(at_risk.AT_RISK_ASSET_COUNT, 0) AS NET_POSITION,
+    CASE
+        WHEN COALESCE(atp.AVAILABLE_TO_PROMISE, pi.QUANTITY_ON_HAND) + COALESCE(atp.INCOMING_PO_QTY, 0) - COALESCE(at_risk.AT_RISK_ASSET_COUNT, 0) >= COALESCE(at_risk.AT_RISK_ASSET_COUNT, 0) + 1 THEN 'SURPLUS'
+        WHEN COALESCE(atp.AVAILABLE_TO_PROMISE, pi.QUANTITY_ON_HAND) + COALESCE(atp.INCOMING_PO_QTY, 0) - COALESCE(at_risk.AT_RISK_ASSET_COUNT, 0) >= 1 THEN 'ADEQUATE'
+        WHEN COALESCE(atp.AVAILABLE_TO_PROMISE, pi.QUANTITY_ON_HAND) + COALESCE(atp.INCOMING_PO_QTY, 0) - COALESCE(at_risk.AT_RISK_ASSET_COUNT, 0) >= 0 THEN 'TIGHT'
+        ELSE 'DEFICIT'
+    END AS BUFFER_STATUS,
+    CASE WHEN COALESCE(at_risk.AT_RISK_ASSET_COUNT, 0) = 0 THEN NULL ELSE ROUND(COALESCE(at_risk.MIN_RUL_HOURS, 0) / 24.0, 1) END AS EST_DAYS_UNTIL_STOCKOUT,
+    ROUND(COALESCE(at_risk.MIN_RUL_HOURS, 0) / 24.0, 1) AS MIN_RUL_DAYS,
+    po_arrival.EARLIEST_ARRIVAL
+FROM MFGPULSE_DB.RAW_IT.PARTS_INVENTORY pi
+LEFT JOIN (SELECT pol.PART_ID, COUNT(DISTINCT wo.WO_ID) AS TIMES_USED, SUM(wo.TOTAL_COST) AS TOTAL_WO_COST FROM MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES pol JOIN MFGPULSE_DB.RAW_IT.WORK_ORDERS wo ON pol.WO_ID = wo.WO_ID GROUP BY pol.PART_ID) wo_usage ON pi.PART_ID = wo_usage.PART_ID
+LEFT JOIN (SELECT pol.PART_ID, SUM(pol.QUANTITY_ORDERED) AS TOTAL_ORDERED, MAX(po.CREATED_DATE) AS LAST_ORDERED_DATE FROM MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES pol JOIN MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS po ON pol.PO_ID = po.PO_ID GROUP BY pol.PART_ID) po_history ON pi.PART_ID = po_history.PART_ID
+LEFT JOIN (SELECT PART_ID, COUNT(*) AS ACTIVE_RESERVATIONS FROM MFGPULSE_DB.RAW_IT.PART_RESERVATIONS WHERE STATUS = 'active' GROUP BY PART_ID) res ON pi.PART_ID = res.PART_ID
+LEFT JOIN MFGPULSE_DB.ANALYTICS.PARTS_AVAILABLE_TO_PROMISE atp ON pi.PART_ID = atp.PART_ID
+LEFT JOIN (SELECT ps2.PART_ID, s.SUPPLIER_NAME FROM MFGPULSE_DB.RAW_IT.PART_SUPPLIERS ps2 JOIN MFGPULSE_DB.RAW_IT.SUPPLIERS s ON ps2.SUPPLIER_ID = s.SUPPLIER_ID WHERE ps2.PREFERRED_SUPPLIER = TRUE QUALIFY ROW_NUMBER() OVER (PARTITION BY ps2.PART_ID ORDER BY ps2.UNIT_COST) = 1) ps ON pi.PART_ID = ps.PART_ID
+LEFT JOIN (SELECT pi2.PART_ID, COUNT(DISTINCT lp.ASSET_ID) AS AT_RISK_ASSET_COUNT, LISTAGG(DISTINCT lp.ASSET_NAME, ', ') WITHIN GROUP (ORDER BY lp.ASSET_NAME) AS AT_RISK_ASSETS, MIN(lp.RUL_HOURS) AS MIN_RUL_HOURS FROM MFGPULSE_DB.RAW_IT.PARTS_INVENTORY pi2 JOIN MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS lp ON ARRAY_CONTAINS(lp.ASSET_ID::VARIANT, pi2.COMPATIBLE_ASSETS) WHERE lp.FAILURE_MODE_PRED != 'normal' OR lp.STAGE_PRED IN ('Warning','Critical') GROUP BY pi2.PART_ID) at_risk ON pi.PART_ID = at_risk.PART_ID
+LEFT JOIN (SELECT pol.PART_ID, MIN(po.EXPECTED_ARRIVAL_DATE) AS EARLIEST_ARRIVAL FROM MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES pol JOIN MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS po ON pol.PO_ID = po.PO_ID WHERE po.STATUS NOT IN ('cancelled','received') GROUP BY pol.PART_ID) po_arrival ON pi.PART_ID = po_arrival.PART_ID;
+create or replace view PLANNED_PURCHASE_ORDERS(
+	PPO_ID,
+	PART_ID,
+	PART_NAME,
+	SUPPLIER_ID,
+	SUPPLIER_NAME,
+	ASSET_COUNT,
+	ASSET_LIST,
+	TOTAL_QTY_NEEDED,
+	ESTIMATED_TOTAL_COST,
+	UNIT_COST,
+	LEAD_TIME_DAYS,
+	MIN_RUL_HOURS,
+	MIN_RUL_DAYS,
+	EARLIEST_REQUIRED_BY,
+	AVAILABLE_TO_PROMISE,
+	INCOMING_PO_QTY,
+	NET_POSITION,
+	STANDARD_ORDER_DATE,
+	STANDARD_ARRIVAL_DATE,
+	EXPEDITE_ARRIVAL_DATE,
+	ORDER_BY_DEADLINE,
+	EXPEDITE_DEADLINE,
+	AUTO_CONVERT_DUE,
+	DAYS_UNTIL_AUTO_CONVERT,
+	PRIORITY_CLASSIFICATION,
+	PRIORITY_SCORE,
+	PPO_STATUS,
+	HAS_CRITICAL_ASSET,
+	HAS_CRITICAL_SHORTAGE,
+	HAS_EXPEDITE_RISK
+) as
+WITH demand_by_part AS (
+    SELECT pr.PART_ID, pr.PART_NAME, pr.SUPPLIER_ID, pr.SUPPLIER_NAME,
+        pr.LEAD_TIME_DAYS, pr.UNIT_COST,
+        COUNT(DISTINCT pr.ASSET_ID) AS ASSET_COUNT,
+        LISTAGG(DISTINCT pr.ASSET_NAME, ', ') AS ASSET_LIST,
+        SUM(pr.REQUIRED_QUANTITY) AS TOTAL_QTY_NEEDED,
+        MIN(pr.RUL_HOURS) AS MIN_RUL_HOURS,
+        MIN(pr.REQUIRED_BY_DATE) AS EARLIEST_REQUIRED_BY,
+        MAX(CASE WHEN pr.STAGE_PRED = 'Critical' THEN 1 ELSE 0 END) AS HAS_CRITICAL_ASSET,
+        MAX(CASE WHEN pr.PROCUREMENT_RISK = 'CRITICAL_SHORTAGE' THEN 1 ELSE 0 END) AS HAS_CRITICAL_SHORTAGE,
+        MAX(CASE WHEN pr.PROCUREMENT_RISK = 'EXPEDITE' THEN 1 ELSE 0 END) AS HAS_EXPEDITE_RISK,
+        pr.AVAILABLE_TO_PROMISE, pr.INCOMING_PO_QTY, pr.NET_POSITION
+    FROM MFGPULSE_DB.ANALYTICS.PROCUREMENT_RECOMMENDATIONS pr
+    WHERE pr.RECOMMENDED_PROCUREMENT_ACTION IN (
+        'CREATE_PO', 'EXPEDITE_PO', 'ESCALATE', 'RESERVE_AND_ORDER',
+        'ESCALATE_CRITICAL_SHORTAGE', 'RESERVE_AND_REORDER', 'ESCALATE_NO_WO'
+    )
+      AND pr.OPEN_PO_ID IS NULL
+    GROUP BY pr.PART_ID, pr.PART_NAME, pr.SUPPLIER_ID, pr.SUPPLIER_NAME,
+             pr.LEAD_TIME_DAYS, pr.UNIT_COST, pr.AVAILABLE_TO_PROMISE, pr.INCOMING_PO_QTY, pr.NET_POSITION
+),
+with_timing AS (
+    SELECT d.*,
+        'PPO-' || d.PART_ID || '-' || TO_CHAR(CURRENT_DATE(), 'YYYYMMDD') AS PPO_ID,
+        CURRENT_DATE() AS STANDARD_ORDER_DATE,
+        DATEADD('day', d.LEAD_TIME_DAYS, CURRENT_DATE()) AS STANDARD_ARRIVAL_DATE,
+        DATEADD('day', GREATEST(CEIL(d.LEAD_TIME_DAYS / 2.0), 1), CURRENT_DATE()) AS EXPEDITE_ARRIVAL_DATE,
+        DATEADD('day', -1 * d.LEAD_TIME_DAYS, d.EARLIEST_REQUIRED_BY) AS ORDER_BY_DEADLINE,
+        DATEADD('day', -1 * GREATEST(CEIL(d.LEAD_TIME_DAYS / 2.0), 1), d.EARLIEST_REQUIRED_BY) AS EXPEDITE_DEADLINE,
+        d.TOTAL_QTY_NEEDED * d.UNIT_COST AS ESTIMATED_TOTAL_COST,
+        ROUND(
+            LEAST(1.0, GREATEST(0, (336.0 - COALESCE(d.MIN_RUL_HOURS, 336)) / 336.0)) * 0.40
+            + LEAST(1.0, GREATEST(0, (0.0 - COALESCE(d.NET_POSITION, 0)) / GREATEST(d.TOTAL_QTY_NEEDED, 1))) * 0.30
+            + LEAST(1.0, (d.ASSET_COUNT - 1.0) / 4.0) * 0.20
+            + d.HAS_CRITICAL_ASSET * 0.10
+        , 3) AS PRIORITY_SCORE
+    FROM demand_by_part d
+)
+SELECT t.PPO_ID, t.PART_ID, t.PART_NAME, t.SUPPLIER_ID, t.SUPPLIER_NAME,
+    t.ASSET_COUNT, t.ASSET_LIST, t.TOTAL_QTY_NEEDED, t.ESTIMATED_TOTAL_COST, t.UNIT_COST,
+    t.LEAD_TIME_DAYS, t.MIN_RUL_HOURS, ROUND(t.MIN_RUL_HOURS / 24.0, 1) AS MIN_RUL_DAYS,
+    t.EARLIEST_REQUIRED_BY, t.AVAILABLE_TO_PROMISE, t.INCOMING_PO_QTY, t.NET_POSITION,
+    t.STANDARD_ORDER_DATE, t.STANDARD_ARRIVAL_DATE, t.EXPEDITE_ARRIVAL_DATE,
+    t.ORDER_BY_DEADLINE, t.EXPEDITE_DEADLINE,
+    CASE WHEN CURRENT_DATE() >= t.ORDER_BY_DEADLINE THEN TRUE ELSE FALSE END AS AUTO_CONVERT_DUE,
+    DATEDIFF('day', CURRENT_DATE(), t.ORDER_BY_DEADLINE) AS DAYS_UNTIL_AUTO_CONVERT,
+    CASE WHEN t.PRIORITY_SCORE >= 0.7 THEN 'EMERGENCY' WHEN t.PRIORITY_SCORE >= 0.4 THEN 'HIGH'
+         WHEN t.PRIORITY_SCORE >= 0.2 THEN 'NORMAL' ELSE 'LOW' END AS PRIORITY_CLASSIFICATION,
+    t.PRIORITY_SCORE,
+    CASE WHEN t.HAS_CRITICAL_SHORTAGE = 1 THEN 'EXPEDITE_IMMEDIATELY'
+         WHEN CURRENT_DATE() >= t.ORDER_BY_DEADLINE THEN 'AUTO_CONVERTING'
+         WHEN DATEDIFF('day', CURRENT_DATE(), t.ORDER_BY_DEADLINE) <= 2 THEN 'ORDER_SOON'
+         WHEN t.HAS_EXPEDITE_RISK = 1 THEN 'REVIEW_AND_EXPEDITE'
+         ELSE 'PLANNED' END AS PPO_STATUS,
+    t.HAS_CRITICAL_ASSET, t.HAS_CRITICAL_SHORTAGE, t.HAS_EXPEDITE_RISK
+FROM with_timing t;
+create or replace view PREDICTIONS_WITH_COST(
+	ASSET_ID,
+	ASSET_NAME,
+	ASSET_TYPE,
+	LINE_ID,
+	PREDICTION_TIME,
+	FAILURE_MODE_PRED,
+	FAILURE_MODE_CONFIDENCE,
+	RUL_HOURS,
+	RUL_LOWER_CI,
+	RUL_UPPER_CI,
+	STAGE_PRED,
+	DEGRADATION_SCORE,
+	TRANSITION_PROBABILITY,
+	FATIGUE_SCORE,
+	FATIGUE_LEVEL,
+	COMPOSITE_HEALTH_SCORE,
+	STRESS_INDEX,
+	ESTIMATED_FAILURE_COST,
+	PLANNED_REPAIR_COST,
+	COST_OF_INACTION,
+	SHIFTS_REMAINING,
+	ACTION_WINDOW,
+	RECOMMENDED_PART,
+	PARTS_IN_STOCK,
+	PART_LEAD_TIME,
+	PARTS_STATUS,
+	OPEN_WO_ID,
+	WO_ASSIGNED_TO,
+	WO_PRIORITY
+) as
+SELECT 
+    p.ASSET_ID, p.ASSET_NAME, p.ASSET_TYPE, p.LINE_ID, p.PREDICTION_TIME,
+    p.FAILURE_MODE_PRED, p.FAILURE_MODE_CONFIDENCE, p.RUL_HOURS, p.RUL_LOWER_CI, p.RUL_UPPER_CI,
+    p.STAGE_PRED, p.DEGRADATION_SCORE, p.TRANSITION_PROBABILITY,
+    p.FATIGUE_SCORE, p.FATIGUE_LEVEL, p.COMPOSITE_HEALTH_SCORE, p.STRESS_INDEX,
+    CASE 
+        WHEN p.RUL_HOURS < 48 THEN ROUND(ci.AVG_COST_PER_EMERGENCY_FAILURE * (1 + p.DEGRADATION_SCORE), 0)
+        WHEN p.RUL_HOURS < 120 THEN ROUND(ci.AVG_COST_PER_EMERGENCY_FAILURE * 0.7, 0)
+        ELSE ROUND(ci.AVG_COST_PER_EMERGENCY_FAILURE * 0.4, 0)
+    END AS ESTIMATED_FAILURE_COST,
+    CASE 
+        WHEN p.RUL_HOURS < 48 THEN ROUND(ci.AVG_COST_PER_PLANNED_REPAIR * 1.3, 0)
+        WHEN p.RUL_HOURS < 120 THEN ROUND(ci.AVG_COST_PER_PLANNED_REPAIR, 0)
+        ELSE ROUND(ci.AVG_COST_PER_PLANNED_REPAIR * 0.8, 0)
+    END AS PLANNED_REPAIR_COST,
+    CASE 
+        WHEN p.RUL_HOURS < 48 THEN ROUND(ci.AVG_COST_PER_EMERGENCY_FAILURE * (1 + p.DEGRADATION_SCORE) - ci.AVG_COST_PER_PLANNED_REPAIR * 1.3, 0)
+        WHEN p.RUL_HOURS < 120 THEN ROUND(ci.AVG_COST_PER_EMERGENCY_FAILURE * 0.7 - ci.AVG_COST_PER_PLANNED_REPAIR, 0)
+        ELSE ROUND(ci.AVG_COST_PER_EMERGENCY_FAILURE * 0.4 - ci.AVG_COST_PER_PLANNED_REPAIR * 0.8, 0)
+    END AS COST_OF_INACTION,
+    ROUND(p.RUL_HOURS / 8, 1) AS SHIFTS_REMAINING,
+    CASE WHEN p.RUL_HOURS < 24 THEN 'IMMEDIATE' WHEN p.RUL_HOURS < 48 THEN 'THIS SHIFT' WHEN p.RUL_HOURS < 120 THEN 'THIS WEEK' ELSE 'SCHEDULED' END AS ACTION_WINDOW,
+    pi.PART_NAME AS RECOMMENDED_PART,
+    pi.QUANTITY_ON_HAND AS PARTS_IN_STOCK,
+    pi.LEAD_TIME_DAYS AS PART_LEAD_TIME,
+    CASE WHEN pi.QUANTITY_ON_HAND > 0 THEN 'IN STOCK' WHEN pi.QUANTITY_ON_HAND = 0 THEN 'ORDER NEEDED' ELSE 'CHECK INVENTORY' END AS PARTS_STATUS,
+    wo.WO_ID AS OPEN_WO_ID,
+    wo.ASSIGNED_TO AS WO_ASSIGNED_TO,
+    wo.PRIORITY AS WO_PRIORITY
+FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS p
+CROSS JOIN MFGPULSE_DB.ANALYTICS.COST_IMPACT ci
+LEFT JOIN MFGPULSE_DB.RAW_IT.PARTS_INVENTORY pi
+    ON ARRAY_CONTAINS(p.ASSET_ID::VARIANT, pi.COMPATIBLE_ASSETS)
+LEFT JOIN MFGPULSE_DB.RAW_IT.WORK_ORDERS wo
+    ON wo.ASSET_ID = p.ASSET_ID AND wo.STATUS = 'open'
+QUALIFY ROW_NUMBER() OVER (PARTITION BY p.ASSET_ID ORDER BY pi.UNIT_COST DESC NULLS LAST) = 1;
+create or replace view PROACTIVE_REORDER(
+	PART_ID,
+	PART_NAME,
+	QUANTITY_ON_HAND,
+	LEAD_TIME_DAYS,
+	UNIT_COST,
+	SUPPLIER_NAME,
+	COMPATIBLE_ASSET_COUNT,
+	REORDER_STATUS,
+	RECOMMENDED_ACTION
+) as
+SELECT 
+    pi.PART_ID, pi.PART_NAME, pi.QUANTITY_ON_HAND,
+    pi.LEAD_TIME_DAYS, pi.UNIT_COST,
+    COALESCE(ps.SUPPLIER_NAME, 'No Supplier') AS SUPPLIER_NAME,
+    ARRAY_SIZE(pi.COMPATIBLE_ASSETS) AS COMPATIBLE_ASSET_COUNT,
+    CASE 
+        WHEN pi.QUANTITY_ON_HAND = 0 THEN 'CRITICAL_STOCKOUT'
+        WHEN pi.QUANTITY_ON_HAND <= 1 THEN 'LOW_STOCK_REORDER'
+        ELSE 'MONITOR'
+    END AS REORDER_STATUS,
+    CASE 
+        WHEN pi.QUANTITY_ON_HAND = 0 THEN 'EMERGENCY_REORDER'
+        WHEN pi.QUANTITY_ON_HAND <= 1 AND pi.LEAD_TIME_DAYS > 14 THEN 'EXPEDITE_REORDER'
+        WHEN pi.QUANTITY_ON_HAND <= 1 THEN 'STANDARD_REORDER'
+        ELSE 'NO_ACTION'
+    END AS RECOMMENDED_ACTION
+FROM MFGPULSE_DB.RAW_IT.PARTS_INVENTORY pi
+LEFT JOIN (
+    SELECT ps2.PART_ID, s.SUPPLIER_NAME
+    FROM MFGPULSE_DB.RAW_IT.PART_SUPPLIERS ps2
+    JOIN MFGPULSE_DB.RAW_IT.SUPPLIERS s ON ps2.SUPPLIER_ID = s.SUPPLIER_ID
+    WHERE ps2.PREFERRED_SUPPLIER = TRUE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY ps2.PART_ID ORDER BY ps2.UNIT_COST) = 1
+) ps ON pi.PART_ID = ps.PART_ID
+WHERE pi.QUANTITY_ON_HAND <= 1;
+create or replace view PROCUREMENT_PERFORMANCE(
+	WO_ID,
+	ASSET_ID,
+	ASSET_NAME,
+	ASSET_TYPE,
+	WO_TYPE,
+	WO_STATUS,
+	WO_CREATED,
+	WO_COMPLETED,
+	ROOT_CAUSE_CONFIRMED,
+	PART_USED,
+	WO_COST,
+	PO_ID,
+	PART_ID,
+	PO_STATUS,
+	WO_TO_PO_LAG_HOURS,
+	WO_BLOCKED_HOURS,
+	REPEAT_FAILURE_COUNT,
+	REPEAT_FAILURE_MODE,
+	COST_AVOIDED,
+	PREDICTION_LED_TO_WO,
+	PART_CONSUMPTION_OUTCOME
+) as
+WITH wo_po_link AS (
+    SELECT wo.WO_ID, wo.ASSET_ID, wo.WO_TYPE, wo.CREATED_DATE AS WO_CREATED,
+        wo.COMPLETED_DATE AS WO_COMPLETED, wo.STATUS AS WO_STATUS,
+        wo.ROOT_CAUSE_CONFIRMED, wo.PART_USED, wo.TOTAL_COST AS WO_COST,
+        pol.PO_ID, pol.PART_ID, pol.FAILURE_MODE_PRED AS PRED_AT_ORDER,
+        po.CREATED_DATE AS PO_CREATED, po.STATUS AS PO_STATUS,
+        po.EXPECTED_ARRIVAL_DATE, am.ASSET_NAME, am.ASSET_TYPE
+    FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS wo
+    JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON wo.ASSET_ID = am.ASSET_ID
+    LEFT JOIN MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES pol ON wo.WO_ID = pol.WO_ID
+    LEFT JOIN MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS po ON pol.PO_ID = po.PO_ID
+),
+wo_po_lag AS (
+    SELECT WO_ID, ASSET_ID, ASSET_NAME, WO_CREATED, PO_CREATED,
+        DATEDIFF('hour', WO_CREATED, PO_CREATED) AS WO_TO_PO_LAG_HOURS
+    FROM wo_po_link WHERE PO_CREATED IS NOT NULL
+),
+wo_blocked AS (
+    SELECT wo.WO_ID, wo.ASSET_ID, wo.CREATED_DATE AS WO_CREATED,
+        MIN(n.CREATED_AT) AS FIRST_START,
+        DATEDIFF('hour', wo.CREATED_DATE, MIN(n.CREATED_AT)) AS WO_BLOCKED_HOURS
+    FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS wo
+    LEFT JOIN MFGPULSE_DB.RAW_IT.APP_NOTIFICATIONS n ON n.WO_ID = wo.WO_ID AND n.EVENT_TYPE = 'WO_STARTED'
+    WHERE wo.STATUS IN ('in_progress', 'completed')
+    GROUP BY wo.WO_ID, wo.ASSET_ID, wo.CREATED_DATE
+),
+repeat_failures AS (
+    SELECT w1.WO_ID, w1.ASSET_ID, w1.ROOT_CAUSE_CONFIRMED AS FAILURE_MODE, COUNT(w2.WO_ID) AS REPEAT_COUNT
+    FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS w1
+    JOIN MFGPULSE_DB.RAW_IT.WORK_ORDERS w2
+        ON w1.ASSET_ID = w2.ASSET_ID AND w1.ROOT_CAUSE_CONFIRMED = w2.ROOT_CAUSE_CONFIRMED
+        AND w2.CREATED_DATE > w1.COMPLETED_DATE AND w2.CREATED_DATE <= DATEADD('day', 60, w1.COMPLETED_DATE)
+        AND w1.WO_ID != w2.WO_ID
+    WHERE w1.STATUS = 'completed' AND w1.ROOT_CAUSE_CONFIRMED IS NOT NULL
+    GROUP BY w1.WO_ID, w1.ASSET_ID, w1.ROOT_CAUSE_CONFIRMED
+),
+cost_avoidance AS (
+    SELECT wo.WO_ID, wo.ASSET_ID, wo.WO_TYPE, wo.TOTAL_COST,
+        CASE WHEN wo.WO_TYPE IN ('preventive','corrective') THEN
+            (SELECT AVG(w2.TOTAL_COST) FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS w2
+             WHERE w2.WO_TYPE = 'emergency' AND w2.ASSET_ID = wo.ASSET_ID AND w2.TOTAL_COST IS NOT NULL)
+            - wo.TOTAL_COST
+        ELSE 0 END AS COST_AVOIDED
+    FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS wo
+    WHERE wo.STATUS = 'completed' AND wo.TOTAL_COST IS NOT NULL
+)
+SELECT wpl.WO_ID, wpl.ASSET_ID, wpl.ASSET_NAME, wpl.ASSET_TYPE,
+    wpl.WO_TYPE, wpl.WO_STATUS, wpl.WO_CREATED, wpl.WO_COMPLETED,
+    wpl.ROOT_CAUSE_CONFIRMED, wpl.PART_USED, wpl.WO_COST,
+    wpl.PO_ID, wpl.PART_ID, wpl.PO_STATUS,
+    wpl2.WO_TO_PO_LAG_HOURS,
+    COALESCE(wb.WO_BLOCKED_HOURS, 0) AS WO_BLOCKED_HOURS,
+    COALESCE(rf.REPEAT_COUNT, 0) AS REPEAT_FAILURE_COUNT,
+    rf.FAILURE_MODE AS REPEAT_FAILURE_MODE,
+    COALESCE(ca.COST_AVOIDED, 0) AS COST_AVOIDED,
+    CASE WHEN wpl.WO_TYPE IN ('preventive','corrective') AND wpl.ROOT_CAUSE_CONFIRMED IS NOT NULL THEN TRUE ELSE FALSE END AS PREDICTION_LED_TO_WO,
+    CASE WHEN wpl.PART_USED = TRUE AND wpl.WO_TYPE IN ('preventive','corrective') THEN 'CONSUMED_AS_PREDICTED'
+         WHEN wpl.PART_USED = FALSE AND wpl.WO_TYPE IN ('preventive','corrective') THEN 'NOT_CONSUMED'
+         ELSE 'N/A' END AS PART_CONSUMPTION_OUTCOME
+FROM wo_po_link wpl
+LEFT JOIN wo_po_lag wpl2 ON wpl.WO_ID = wpl2.WO_ID
+LEFT JOIN wo_blocked wb ON wpl.WO_ID = wb.WO_ID
+LEFT JOIN repeat_failures rf ON wpl.WO_ID = rf.WO_ID
+LEFT JOIN cost_avoidance ca ON wpl.WO_ID = ca.WO_ID
+QUALIFY ROW_NUMBER() OVER (PARTITION BY wpl.WO_ID ORDER BY wpl.PO_CREATED DESC NULLS LAST) = 1;
+create or replace view PROCUREMENT_RECOMMENDATIONS(
+	ASSET_ID,
+	ASSET_NAME,
+	PART_ID,
+	PART_NAME,
+	SUPPLIER_ID,
+	SUPPLIER_NAME,
+	RUL_HOURS,
+	STAGE_PRED,
+	FAILURE_MODE_PRED,
+	DEGRADATION_SCORE,
+	FATIGUE_SCORE,
+	PROCUREMENT_RISK,
+	RECOMMENDED_PROCUREMENT_ACTION,
+	OPEN_PO_ID,
+	WO_ID,
+	AVAILABLE_TO_PROMISE,
+	EFFECTIVE_ATP,
+	INCOMING_PO_QTY,
+	NET_POSITION,
+	REQUIRED_QUANTITY,
+	REQUIRED_BY_DATE,
+	LEAD_TIME_DAYS,
+	UNIT_COST,
+	COMPETING_ASSETS,
+	HAS_ACTIVE_RESERVATION,
+	RESERVED_QTY,
+	LEAD_TIME_FEASIBLE,
+	BUFFER_STATUS,
+	LEAD_TIME_GAP_DAYS,
+	EARLIEST_PO_ARRIVAL,
+	GAP_TYPE
+) as
+WITH asset_predictions AS (
+    SELECT lp.ASSET_ID, lp.ASSET_NAME, lp.FAILURE_MODE_PRED, lp.RUL_HOURS,
+        lp.STAGE_PRED, lp.DEGRADATION_SCORE, lp.FATIGUE_SCORE
+    FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS lp
+    WHERE lp.FAILURE_MODE_PRED != 'normal' OR lp.STAGE_PRED IN ('Warning','Critical')
+),
+compatible_parts AS (
+    SELECT DISTINCT
+        ap.ASSET_ID, ap.ASSET_NAME, ap.FAILURE_MODE_PRED, ap.RUL_HOURS,
+        ap.STAGE_PRED, ap.DEGRADATION_SCORE, ap.FATIGUE_SCORE,
+        pi.PART_ID, pi.PART_NAME, pi.UNIT_COST, pi.LEAD_TIME_DAYS
+    FROM asset_predictions ap
+    JOIN MFGPULSE_DB.RAW_IT.PARTS_INVENTORY pi
+      ON ARRAY_CONTAINS(ap.ASSET_ID::VARIANT, pi.COMPATIBLE_ASSETS)
+),
+competing_assets AS (
+    SELECT pi2.PART_ID, COUNT(DISTINCT lp2.ASSET_ID) AS COMPETING_ASSETS
+    FROM MFGPULSE_DB.RAW_IT.PARTS_INVENTORY pi2
+    JOIN MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS lp2
+      ON ARRAY_CONTAINS(lp2.ASSET_ID::VARIANT, pi2.COMPATIBLE_ASSETS)
+    WHERE lp2.FAILURE_MODE_PRED != 'normal' OR lp2.STAGE_PRED IN ('Warning','Critical')
+    GROUP BY pi2.PART_ID
+),
+active_reservations AS (
+    SELECT PART_ID, ASSET_ID, WO_ID, SUM(QUANTITY_RESERVED) AS RESERVED_QTY
+    FROM MFGPULSE_DB.RAW_IT.PART_RESERVATIONS
+    WHERE STATUS = 'active'
+    GROUP BY PART_ID, ASSET_ID, WO_ID
+),
+earliest_arrivals AS (
+    SELECT pol.PART_ID, MIN(po.EXPECTED_ARRIVAL_DATE) AS EARLIEST_PO_ARRIVAL
+    FROM MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES pol
+    JOIN MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS po ON pol.PO_ID = po.PO_ID
+    WHERE po.STATUS NOT IN ('cancelled','received')
+    GROUP BY pol.PART_ID
+),
+with_supply AS (
+    SELECT cp.*,
+        atp.AVAILABLE_TO_PROMISE,
+        atp.INCOMING_PO_QTY,
+        COALESCE(atp.SUPPLIER_NAME, 'Unknown') AS SUPPLIER_NAME,
+        COALESCE(ps.SUPPLIER_ID, 'SUP-001') AS SUPPLIER_ID,
+        1 AS REQUIRED_QUANTITY,
+        GREATEST(0, COALESCE(atp.AVAILABLE_TO_PROMISE, 0)
+            - GREATEST(0, COALESCE(ca.COMPETING_ASSETS, 1) - 1)) AS EFFECTIVE_ATP,
+        COALESCE(atp.AVAILABLE_TO_PROMISE, 0) + COALESCE(atp.INCOMING_PO_QTY, 0) - 1 AS NET_POSITION,
+        DATEADD('hour', GREATEST(cp.RUL_HOURS - 24, 0), CURRENT_TIMESTAMP())::DATE AS REQUIRED_BY_DATE,
+        CASE WHEN cp.LEAD_TIME_DAYS * 24 <= cp.RUL_HOURS THEN TRUE ELSE FALSE END AS LEAD_TIME_FEASIBLE,
+        epo.OPEN_PO_ID,
+        wo.WO_ID,
+        COALESCE(ca.COMPETING_ASSETS, 1) AS COMPETING_ASSETS,
+        ea.EARLIEST_PO_ARRIVAL,
+        CASE WHEN ar.RESERVED_QTY > 0 THEN TRUE ELSE FALSE END AS HAS_ACTIVE_RESERVATION,
+        COALESCE(ar.RESERVED_QTY, 0) AS RESERVED_QTY
+    FROM compatible_parts cp
+    LEFT JOIN MFGPULSE_DB.ANALYTICS.PARTS_AVAILABLE_TO_PROMISE atp ON cp.PART_ID = atp.PART_ID
+    LEFT JOIN (
+        SELECT ps2.PART_ID, ps2.SUPPLIER_ID
+        FROM MFGPULSE_DB.RAW_IT.PART_SUPPLIERS ps2 WHERE ps2.PREFERRED_SUPPLIER = TRUE
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY ps2.PART_ID ORDER BY ps2.UNIT_COST) = 1
+    ) ps ON cp.PART_ID = ps.PART_ID
+    LEFT JOIN (
+        SELECT pol.PART_ID, pol.ASSET_ID, po.PO_ID AS OPEN_PO_ID
+        FROM MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES pol
+        JOIN MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS po ON pol.PO_ID = po.PO_ID
+        WHERE po.STATUS NOT IN ('cancelled','received')
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY pol.PART_ID, pol.ASSET_ID ORDER BY po.CREATED_DATE DESC) = 1
+    ) epo ON cp.PART_ID = epo.PART_ID AND cp.ASSET_ID = epo.ASSET_ID
+    LEFT JOIN (
+        SELECT ASSET_ID, WO_ID FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS
+        WHERE STATUS IN ('open','in_progress')
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY ASSET_ID ORDER BY CREATED_DATE DESC) = 1
+    ) wo ON cp.ASSET_ID = wo.ASSET_ID
+    LEFT JOIN competing_assets ca ON cp.PART_ID = ca.PART_ID
+    LEFT JOIN earliest_arrivals ea ON cp.PART_ID = ea.PART_ID
+    LEFT JOIN active_reservations ar ON cp.PART_ID = ar.PART_ID AND cp.ASSET_ID = ar.ASSET_ID
+),
+-- Pre-compute buffer status for use in risk/action logic
+with_buffer AS (
+    SELECT ws.*,
+        CASE
+            WHEN ws.NET_POSITION >= ws.COMPETING_ASSETS + 1 THEN 'SURPLUS'
+            WHEN ws.NET_POSITION >= ws.REQUIRED_QUANTITY THEN 'ADEQUATE'
+            WHEN ws.NET_POSITION >= 0 THEN 'TIGHT'
+            ELSE 'DEFICIT'
+        END AS BUFFER_STATUS
+    FROM with_supply ws
+)
+SELECT
+    wb.ASSET_ID, wb.ASSET_NAME, wb.PART_ID, wb.PART_NAME,
+    wb.SUPPLIER_ID, wb.SUPPLIER_NAME,
+    wb.RUL_HOURS, wb.STAGE_PRED, wb.FAILURE_MODE_PRED,
+    wb.DEGRADATION_SCORE, wb.FATIGUE_SCORE,
+    -- PROCUREMENT_RISK: SURPLUS buffer = no risk even if RUL is low
+    CASE
+        WHEN wb.HAS_ACTIVE_RESERVATION                                         THEN 'RESERVED'
+        WHEN wb.AVAILABLE_TO_PROMISE <= 0 AND wb.INCOMING_PO_QTY <= 0          THEN 'CRITICAL_SHORTAGE'
+        WHEN wb.RUL_HOURS < 72  AND wb.EFFECTIVE_ATP < wb.REQUIRED_QUANTITY
+             AND NOT wb.LEAD_TIME_FEASIBLE                                      THEN 'EXPEDITE'
+        WHEN wb.RUL_HOURS < 72  AND wb.EFFECTIVE_ATP < wb.REQUIRED_QUANTITY    THEN 'EXPEDITE'
+        WHEN wb.RUL_HOURS < 72  AND wb.BUFFER_STATUS = 'SURPLUS'              THEN 'NO_RISK'
+        WHEN wb.RUL_HOURS < 72  AND wb.EFFECTIVE_ATP >= wb.REQUIRED_QUANTITY   THEN 'REPLENISH_NOW'
+        WHEN NOT wb.LEAD_TIME_FEASIBLE AND wb.RUL_HOURS < 336
+             AND wb.STAGE_PRED IN ('Warning','Critical')
+             AND wb.BUFFER_STATUS != 'SURPLUS'                                  THEN 'EXPEDITE'
+        WHEN wb.NET_POSITION < 0                                                THEN 'ORDER_NOW'
+        WHEN wb.RUL_HOURS < 336 AND wb.EFFECTIVE_ATP < wb.REQUIRED_QUANTITY
+             AND NOT wb.LEAD_TIME_FEASIBLE                                      THEN 'EXPEDITE'
+        WHEN wb.RUL_HOURS < 336 AND wb.EFFECTIVE_ATP < wb.REQUIRED_QUANTITY    THEN 'ORDER_NOW'
+        WHEN wb.RUL_HOURS < 336 AND wb.BUFFER_STATUS = 'SURPLUS'              THEN 'NO_RISK'
+        WHEN wb.RUL_HOURS < 336 AND wb.EFFECTIVE_ATP >= wb.REQUIRED_QUANTITY   THEN 'REPLENISH_NOW'
+        ELSE 'NO_RISK'
+    END AS PROCUREMENT_RISK,
+    -- RECOMMENDED_PROCUREMENT_ACTION: SURPLUS = no reorder needed
+    CASE
+        WHEN wb.HAS_ACTIVE_RESERVATION                                         THEN 'MONITOR_RESERVATION'
+        WHEN wb.OPEN_PO_ID IS NOT NULL                                          THEN 'MONITOR_EXISTING_PO'
+        WHEN wb.AVAILABLE_TO_PROMISE <= 0 AND wb.INCOMING_PO_QTY <= 0          THEN 'ESCALATE_CRITICAL_SHORTAGE'
+        WHEN wb.WO_ID IS NULL AND wb.RUL_HOURS < 72
+             AND wb.STAGE_PRED IN ('Warning','Critical')                        THEN 'ESCALATE_NO_WO'
+        WHEN wb.RUL_HOURS < 72  AND wb.BUFFER_STATUS = 'SURPLUS'              THEN 'NO_ACTION'
+        WHEN wb.RUL_HOURS < 72  AND wb.EFFECTIVE_ATP >= wb.REQUIRED_QUANTITY   THEN 'RESERVE_AND_REORDER'
+        WHEN wb.RUL_HOURS < 72  AND NOT wb.LEAD_TIME_FEASIBLE                 THEN 'ESCALATE_CRITICAL_SHORTAGE'
+        WHEN wb.RUL_HOURS < 72                                                  THEN 'EXPEDITE_PO'
+        WHEN wb.BUFFER_STATUS = 'SURPLUS' AND wb.RUL_HOURS < 336              THEN 'NO_ACTION'
+        WHEN wb.EFFECTIVE_ATP >= wb.REQUIRED_QUANTITY AND wb.RUL_HOURS < 336   THEN 'RESERVE_AND_REORDER'
+        WHEN wb.NET_POSITION < 0                                                THEN 'CREATE_PO'
+        WHEN wb.RUL_HOURS < 336 AND NOT wb.LEAD_TIME_FEASIBLE                 THEN 'EXPEDITE_PO'
+        WHEN wb.RUL_HOURS < 336                                                 THEN 'CREATE_PO'
+        ELSE 'NO_ACTION'
+    END AS RECOMMENDED_PROCUREMENT_ACTION,
+    wb.OPEN_PO_ID, wb.WO_ID,
+    wb.AVAILABLE_TO_PROMISE, wb.EFFECTIVE_ATP, wb.INCOMING_PO_QTY, wb.NET_POSITION,
+    wb.REQUIRED_QUANTITY, wb.REQUIRED_BY_DATE,
+    wb.LEAD_TIME_DAYS, wb.UNIT_COST,
+    wb.COMPETING_ASSETS,
+    wb.HAS_ACTIVE_RESERVATION, wb.RESERVED_QTY,
+    wb.LEAD_TIME_FEASIBLE,
+    wb.BUFFER_STATUS,
+    wb.LEAD_TIME_DAYS - CEIL(wb.RUL_HOURS / 24.0) AS LEAD_TIME_GAP_DAYS,
+    wb.EARLIEST_PO_ARRIVAL,
+    CASE
+        WHEN wb.LEAD_TIME_DAYS - CEIL(wb.RUL_HOURS / 24.0) <= 0 THEN 'NO_GAP'
+        WHEN wb.EFFECTIVE_ATP >= wb.REQUIRED_QUANTITY THEN 'REPLENISHMENT_GAP'
+        ELSE 'FULFILLMENT_GAP'
+    END AS GAP_TYPE
+FROM with_buffer wb;
+create or replace view SHIFT_HANDOVER_VIEW(
+	CRITICAL_ACTION_COUNT,
+	WARNING_COUNT,
+	PLANT_OEE,
+	PLANT_AVAIL,
+	PLANT_PERF,
+	PLANT_QUAL,
+	URGENT_ALERTS,
+	TOTAL_ALERTS,
+	TOTAL_COST_AVOIDED,
+	DOWNTIME_HOURS_PREVENTED,
+	MAINTENANCE_ROI_X,
+	GENERATED_AT
+) as
+WITH critical_actions AS (
+    SELECT ASSET_NAME, FAILURE_MODE_PRED, RUL_HOURS, STAGE_PRED, FATIGUE_SCORE, DEGRADATION_SCORE
+    FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS
+    WHERE STAGE_PRED = 'Critical' AND RUL_HOURS < 72
+    ORDER BY RUL_HOURS ASC
+),
+warnings AS (
+    SELECT ASSET_NAME, STAGE_PRED, RUL_HOURS, FATIGUE_SCORE
+    FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS
+    WHERE STAGE_PRED = 'Critical' AND RUL_HOURS >= 72
+    ORDER BY RUL_HOURS ASC
+),
+plant_oee AS (
+    SELECT ROUND(AVG(OEE_PCT), 1) AS PLANT_OEE,
+        ROUND(AVG(AVAILABILITY_PCT), 1) AS PLANT_AVAIL,
+        ROUND(AVG(PERFORMANCE_PCT), 1) AS PLANT_PERF,
+        ROUND(AVG(QUALITY_PCT), 1) AS PLANT_QUAL
+    FROM MFGPULSE_DB.ANALYTICS.OEE_METRICS
+),
+alert_counts AS (
+    SELECT COUNT(CASE WHEN SEVERITY IN ('CRITICAL','WARNING') THEN 1 END) AS URGENT_ALERTS,
+        COUNT(*) AS TOTAL_ALERTS
+    FROM MFGPULSE_DB.ANALYTICS.ACTIVE_ALERTS
+),
+costs AS (
+    SELECT TOTAL_COST_AVOIDED, DOWNTIME_HOURS_PREVENTED, MAINTENANCE_ROI_X
+    FROM MFGPULSE_DB.ANALYTICS.COST_IMPACT
+)
+SELECT 
+    (SELECT COUNT(*) FROM critical_actions) AS CRITICAL_ACTION_COUNT,
+    (SELECT COUNT(*) FROM warnings) AS WARNING_COUNT,
+    po.PLANT_OEE, po.PLANT_AVAIL, po.PLANT_PERF, po.PLANT_QUAL,
+    ac.URGENT_ALERTS, ac.TOTAL_ALERTS,
+    co.TOTAL_COST_AVOIDED, co.DOWNTIME_HOURS_PREVENTED, co.MAINTENANCE_ROI_X,
+    CURRENT_TIMESTAMP() AS GENERATED_AT
+FROM plant_oee po
+CROSS JOIN alert_counts ac
+CROSS JOIN costs co;
+create or replace view SUPPLIER_SCORECARD(
+	SUPPLIER_ID,
+	SUPPLIER_NAME,
+	CONTACT_EMAIL,
+	TOTAL_POS,
+	DELIVERED_POS,
+	EXPEDITED_POS,
+	DELIVERY_RATE_PCT,
+	AVG_LEAD_TIME_DAYS,
+	AVG_COST_VARIANCE_PCT,
+	TOTAL_SPEND,
+	UNIQUE_PARTS_SUPPLIED,
+	REJECTION_RATE_PCT,
+	SUPPLIER_SCORE
+) as
+WITH po_delivery AS (
+    SELECT po.PO_ID, po.SUPPLIER_ID, po.STATUS, po.CREATED_DATE, po.EXPECTED_ARRIVAL_DATE,
+        po.PRIORITY, pol.PART_ID, pol.UNIT_COST AS LINE_UNIT_COST,
+        ps.UNIT_COST AS CATALOG_UNIT_COST, ps.STANDARD_LEAD_TIME_DAYS, ps.EXPEDITE_LEAD_TIME_DAYS,
+        CASE WHEN po.STATUS = 'received' THEN TRUE ELSE FALSE END AS IS_DELIVERED,
+        CASE WHEN po.PRIORITY IN ('EMERGENCY','HIGH') THEN TRUE ELSE FALSE END AS IS_EXPEDITED
+    FROM MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS po
+    JOIN MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES pol ON po.PO_ID = pol.PO_ID
+    LEFT JOIN MFGPULSE_DB.RAW_IT.PART_SUPPLIERS ps ON pol.PART_ID = ps.PART_ID AND po.SUPPLIER_ID = ps.SUPPLIER_ID
+    WHERE po.STATUS NOT IN ('draft','cancelled')
+)
+SELECT s.SUPPLIER_ID, s.SUPPLIER_NAME, s.CONTACT_EMAIL,
+    COUNT(DISTINCT pd.PO_ID) AS TOTAL_POS,
+    COUNT(DISTINCT CASE WHEN pd.IS_DELIVERED THEN pd.PO_ID END) AS DELIVERED_POS,
+    COUNT(DISTINCT CASE WHEN pd.IS_EXPEDITED THEN pd.PO_ID END) AS EXPEDITED_POS,
+    ROUND(DIV0NULL(COUNT(DISTINCT CASE WHEN pd.IS_DELIVERED THEN pd.PO_ID END), NULLIF(COUNT(DISTINCT pd.PO_ID), 0)) * 100, 1) AS DELIVERY_RATE_PCT,
+    ROUND(AVG(DATEDIFF('day', pd.CREATED_DATE, pd.EXPECTED_ARRIVAL_DATE)), 1) AS AVG_LEAD_TIME_DAYS,
+    ROUND(AVG(CASE WHEN pd.CATALOG_UNIT_COST > 0 THEN (pd.LINE_UNIT_COST - pd.CATALOG_UNIT_COST) / pd.CATALOG_UNIT_COST * 100 ELSE 0 END), 1) AS AVG_COST_VARIANCE_PCT,
+    SUM(pd.LINE_UNIT_COST) AS TOTAL_SPEND,
+    COUNT(DISTINCT pd.PART_ID) AS UNIQUE_PARTS_SUPPLIED,
+    ROUND(DIV0NULL(COUNT(DISTINCT CASE WHEN po_rej.PO_ID IS NOT NULL THEN po_rej.PO_ID END), NULLIF(COUNT(DISTINCT pd.PO_ID), 0)) * 100, 1) AS REJECTION_RATE_PCT,
+    ROUND(
+        (DIV0NULL(COUNT(DISTINCT CASE WHEN pd.IS_DELIVERED THEN pd.PO_ID END), NULLIF(COUNT(DISTINCT pd.PO_ID), 0)) * 40) +
+        (GREATEST(0, 30 - ABS(AVG(CASE WHEN pd.CATALOG_UNIT_COST > 0 THEN (pd.LINE_UNIT_COST - pd.CATALOG_UNIT_COST) / pd.CATALOG_UNIT_COST * 100 ELSE 0 END)))) +
+        ((1 - DIV0NULL(COUNT(DISTINCT CASE WHEN po_rej.PO_ID IS NOT NULL THEN po_rej.PO_ID END), NULLIF(COUNT(DISTINCT pd.PO_ID), 0))) * 30)
+    , 1) AS SUPPLIER_SCORE
+FROM MFGPULSE_DB.RAW_IT.SUPPLIERS s
+LEFT JOIN po_delivery pd ON s.SUPPLIER_ID = pd.SUPPLIER_ID
+LEFT JOIN (SELECT PO_ID FROM MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS WHERE REJECTION_REASON IS NOT NULL) po_rej ON pd.PO_ID = po_rej.PO_ID
+WHERE s.ACTIVE = TRUE
+GROUP BY s.SUPPLIER_ID, s.SUPPLIER_NAME, s.CONTACT_EMAIL;
+CREATE OR REPLACE PROCEDURE "ARCHIVE_ALERTS"()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+DECLARE v_cnt INT;
+BEGIN
+    INSERT INTO MFGPULSE_DB.ANALYTICS.ALERT_HISTORY
+        (ALERT_ID, ASSET_ID, ASSET_NAME, SEVERITY, ALERT_TYPE, MESSAGE, RUL_HOURS, FAILURE_MODE_PRED, FATIGUE_SCORE, CREATED_AT)
+    SELECT ALERT_ID, ASSET_ID, ASSET_NAME, SEVERITY, ALERT_TYPE, MESSAGE, RUL_HOURS, FAILURE_MODE_PRED, FATIGUE_SCORE, CREATED_AT
+    FROM MFGPULSE_DB.ANALYTICS.ACTIVE_ALERTS
+    WHERE ALERT_ID NOT IN (SELECT ALERT_ID FROM MFGPULSE_DB.ANALYTICS.ALERT_HISTORY);
+    
+    v_cnt := SQLROWCOUNT;
+    RETURN ''Archived '' || :v_cnt || '' new alerts'';
+END;
+';
+CREATE OR REPLACE PROCEDURE "AUTO_CONVERT_PLANNED_POS"()
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+DECLARE
+    v_converted NUMBER DEFAULT 0; v_skipped NUMBER DEFAULT 0;
+    c_ppo_id VARCHAR; c_part_id VARCHAR; c_supplier_id VARCHAR;
+    c_total_qty NUMBER; c_required_by DATE; c_asset_list VARCHAR; c_priority VARCHAR;
+    existing_po VARCHAR; v_supplier_id VARCHAR; v_supplier_name VARCHAR;
+    v_lead_time NUMBER; v_unit_cost FLOAT; v_po_id VARCHAR; v_expected_arrival DATE;
+    ppo_cursor CURSOR FOR
+        SELECT PPO_ID, PART_ID, SUPPLIER_ID, TOTAL_QTY_NEEDED, EARLIEST_REQUIRED_BY, ASSET_LIST, PRIORITY_CLASSIFICATION
+        FROM MFGPULSE_DB.ANALYTICS.PLANNED_PURCHASE_ORDERS
+        WHERE AUTO_CONVERT_DUE = TRUE AND PPO_STATUS IN (''AUTO_CONVERTING'', ''EXPEDITE_IMMEDIATELY'');
+BEGIN
+    OPEN ppo_cursor;
+    FOR rec IN ppo_cursor DO
+        c_ppo_id := rec.PPO_ID;
+        c_part_id := rec.PART_ID;
+        c_supplier_id := rec.SUPPLIER_ID;
+        c_total_qty := rec.TOTAL_QTY_NEEDED;
+        c_required_by := rec.EARLIEST_REQUIRED_BY;
+        c_asset_list := rec.ASSET_LIST;
+        c_priority := rec.PRIORITY_CLASSIFICATION;
+        existing_po := NULL;
+        BEGIN
+            SELECT po.PO_ID INTO :existing_po
+            FROM MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES pol
+            JOIN MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS po ON pol.PO_ID = po.PO_ID
+            WHERE pol.PART_ID = :c_part_id AND po.STATUS NOT IN (''cancelled'', ''received'')
+              AND po.SOURCE = ''auto_planned'' LIMIT 1;
+        EXCEPTION WHEN OTHER THEN existing_po := NULL;
+        END;
+        IF (:existing_po IS NOT NULL) THEN
+            v_skipped := :v_skipped + 1;
+        ELSE
+            v_supplier_id := :c_supplier_id;
+            v_supplier_name := ''Unknown'';
+            v_lead_time := 7;
+            v_unit_cost := 0;
+            BEGIN
+                SELECT ps.SUPPLIER_ID, s.SUPPLIER_NAME, ps.STANDARD_LEAD_TIME_DAYS, ps.UNIT_COST
+                INTO :v_supplier_id, :v_supplier_name, :v_lead_time, :v_unit_cost
+                FROM MFGPULSE_DB.RAW_IT.PART_SUPPLIERS ps
+                JOIN MFGPULSE_DB.RAW_IT.SUPPLIERS s ON ps.SUPPLIER_ID = s.SUPPLIER_ID
+                WHERE ps.PART_ID = :c_part_id AND s.ACTIVE = TRUE
+                ORDER BY ps.UNIT_COST ASC LIMIT 1;
+            EXCEPTION WHEN OTHER THEN NULL;
+            END;
+            v_po_id := ''PO-AUTO-'' || TO_CHAR(CURRENT_DATE(), ''YYYYMMDD'') || ''-'' || :c_part_id;
+            v_expected_arrival := DATEADD(''day'', :v_lead_time, CURRENT_DATE());
+            INSERT INTO MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS
+                (PO_ID, SUPPLIER_ID, REQUIRED_BY_DATE, EXPECTED_ARRIVAL_DATE, STATUS, PRIORITY, TOTAL_COST, CREATED_BY, SOURCE)
+            VALUES (:v_po_id, :v_supplier_id, :c_required_by, :v_expected_arrival,
+                ''pending_approval'', :c_priority, :v_unit_cost * :c_total_qty,
+                ''SYSTEM_AUTO_CONVERT'', ''auto_planned'');
+            INSERT INTO MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES
+                (PO_LINE_ID, PO_ID, PART_ID, ASSET_ID, WO_ID, QUANTITY_ORDERED, UNIT_COST, LINE_COST, PROCUREMENT_RISK)
+            SELECT :v_po_id || ''-L'' || ROW_NUMBER() OVER (ORDER BY pr.ASSET_ID),
+                :v_po_id, pr.PART_ID, pr.ASSET_ID, pr.WO_ID, pr.REQUIRED_QUANTITY,
+                :v_unit_cost, :v_unit_cost * pr.REQUIRED_QUANTITY, pr.PROCUREMENT_RISK
+            FROM MFGPULSE_DB.ANALYTICS.PROCUREMENT_RECOMMENDATIONS pr
+            WHERE pr.PART_ID = :c_part_id
+              AND pr.RECOMMENDED_PROCUREMENT_ACTION IN (
+                  ''CREATE_PO'', ''EXPEDITE_PO'', ''ESCALATE'', ''RESERVE_AND_ORDER'',
+                  ''ESCALATE_CRITICAL_SHORTAGE'', ''RESERVE_AND_REORDER'', ''ESCALATE_NO_WO''
+              )
+              AND pr.OPEN_PO_ID IS NULL;
+            BEGIN
+                CALL MFGPULSE_DB.RAW_IT.LOG_APP_NOTIFICATION(
+                    ''PO_CREATED'', ''Auto-converted PPO to PO: '' || :v_po_id,
+                    ''Planned PO '' || :c_ppo_id || '' auto-converted. Part: '' || :c_part_id || '', Qty: '' || :c_total_qty || '', Assets: '' || :c_asset_list,
+                    :v_po_id);
+            EXCEPTION WHEN OTHER THEN NULL;
+            END;
+            v_converted := :v_converted + 1;
+        END IF;
+    END FOR;
+    CLOSE ppo_cursor;
+    RETURN OBJECT_CONSTRUCT(''status'', ''COMPLETE'', ''converted'', :v_converted, ''skipped'', :v_skipped, ''run_at'', CURRENT_TIMESTAMP()::VARCHAR);
+END;
+';
+CREATE OR REPLACE PROCEDURE "AUTO_GENERATE_PURCHASE_ORDERS"()
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+DECLARE
+    v_created NUMBER DEFAULT 0; v_skipped NUMBER DEFAULT 0; v_result VARIANT;
+    c_asset_id VARCHAR; c_part_id VARCHAR; c_required_by DATE; c_wo_id VARCHAR; c_risk VARCHAR;
+    rec_cursor CURSOR FOR
+        SELECT ASSET_ID, PART_ID, REQUIRED_BY_DATE, WO_ID, PROCUREMENT_RISK
+        FROM MFGPULSE_DB.ANALYTICS.PROCUREMENT_RECOMMENDATIONS
+        WHERE RECOMMENDED_PROCUREMENT_ACTION IN (''CREATE_PO'', ''EXPEDITE_PO'', ''ESCALATE_CRITICAL_SHORTAGE'')
+          AND OPEN_PO_ID IS NULL
+          AND (RUL_HOURS < 336 OR STAGE_PRED IN (''Warning'', ''Critical'') OR FAILURE_MODE_PRED != ''normal'');
+BEGIN
+    OPEN rec_cursor;
+    FOR rec IN rec_cursor DO
+        c_asset_id := rec.ASSET_ID;
+        c_part_id := rec.PART_ID;
+        c_required_by := rec.REQUIRED_BY_DATE;
+        c_wo_id := rec.WO_ID;
+        c_risk := rec.PROCUREMENT_RISK;
+        LET priority VARCHAR := CASE
+            WHEN :c_risk = ''CRITICAL_SHORTAGE'' THEN ''EMERGENCY''
+            WHEN :c_risk = ''EXPEDITE'' THEN ''EXPEDITE''
+            ELSE ''HIGH'' END;
+        CALL MFGPULSE_DB.ANALYTICS.GENERATE_PURCHASE_ORDER(
+            :c_asset_id, :c_part_id, 1, :c_required_by, :c_wo_id, :priority);
+        SELECT * INTO :v_result FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+        IF (v_result:status::VARCHAR = ''CREATED'') THEN v_created := :v_created + 1;
+        ELSE v_skipped := :v_skipped + 1; END IF;
+    END FOR;
+    CLOSE rec_cursor;
+    RETURN OBJECT_CONSTRUCT(''status'', ''COMPLETE'', ''pos_created'', :v_created, ''pos_skipped'', :v_skipped);
+END;
+';
+CREATE OR REPLACE PROCEDURE "AUTO_GENERATE_WORK_ORDERS"()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+BEGIN
+    INSERT INTO MFGPULSE_DB.RAW_IT.WORK_ORDERS (WO_ID, ASSET_ID, WO_TYPE, CREATED_DATE, PRIORITY, STATUS, ASSIGNED_TO, LABOR_HOURS, PARTS_COST, TOTAL_COST)
+    WITH candidates AS (
+        SELECT p.ASSET_ID, p.RUL_HOURS, p.DEGRADATION_SCORE, p.FAILURE_MODE_PRED,
+            ROW_NUMBER() OVER (ORDER BY p.RUL_HOURS ASC) AS rn
+        FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS p
+        WHERE (p.RUL_HOURS < 200 OR p.DEGRADATION_SCORE > 0.6 OR p.FAILURE_MODE_PRED != ''normal'')
+            AND NOT EXISTS (SELECT 1 FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS wo WHERE wo.ASSET_ID = p.ASSET_ID AND wo.STATUS IN (''open'',''in_progress''))
+            AND NOT EXISTS (SELECT 1 FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS wo2 WHERE wo2.WO_ID = ''WO-AUTO-'' || p.ASSET_ID || ''-'' || TO_CHAR(CURRENT_TIMESTAMP(), ''YYYYMMDD''))
+    )
+    SELECT ''WO-AUTO-'' || c.ASSET_ID || ''-'' || TO_CHAR(CURRENT_TIMESTAMP(), ''YYYYMMDD''),
+        c.ASSET_ID,
+        CASE WHEN c.RUL_HOURS < 48 THEN ''emergency'' WHEN c.RUL_HOURS < 120 THEN ''corrective'' ELSE ''preventive'' END,
+        CURRENT_TIMESTAMP(),
+        CASE WHEN c.RUL_HOURS < 48 THEN ''EMERGENCY'' WHEN c.RUL_HOURS < 120 THEN ''HIGH'' WHEN c.DEGRADATION_SCORE > 0.7 THEN ''MEDIUM'' ELSE ''LOW'' END,
+        ''open'',
+        CASE MOD(c.rn, 4) WHEN 0 THEN ''Mike Torres'' WHEN 1 THEN ''Sarah Chen'' WHEN 2 THEN ''James Wright'' ELSE ''Maria Garcia'' END,
+        CASE WHEN c.RUL_HOURS < 48 THEN 8 WHEN c.RUL_HOURS < 120 THEN 6 ELSE 4 END,
+        500,
+        CASE WHEN c.RUL_HOURS < 48 THEN 1300 WHEN c.RUL_HOURS < 120 THEN 1100 ELSE 900 END
+    FROM candidates c;
+    BEGIN
+        CALL MFGPULSE_DB.RAW_IT.LOG_APP_NOTIFICATION(
+            ''WO_CREATED'', ''Auto-generated work orders'',
+            ''Work orders auto-generated for at-risk assets at '' || CURRENT_TIMESTAMP()::VARCHAR,
+            ''AUTO_GEN_WO'');
+    EXCEPTION WHEN OTHER THEN NULL;
+    END;
+    RETURN ''Work orders generated at '' || CURRENT_TIMESTAMP()::VARCHAR;
+END;
+';
+CREATE OR REPLACE PROCEDURE "CHECK_DATA_FRESHNESS"()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+DECLARE
+    v_staleness INT;
+    v_status VARCHAR;
+BEGIN
+    SELECT staleness_minutes, freshness_status INTO :v_staleness, :v_status
+    FROM MFGPULSE_DB.ANALYTICS.DATA_FRESHNESS_SLA
+    WHERE source_table = ''SENSOR_READINGS'';
+    
+    IF (:v_status = ''SLA_BREACH'') THEN
+        BEGIN
+            CALL MFGPULSE_DB.RAW_IT.LOG_APP_NOTIFICATION(
+                ''DATA_STALE'',
+                ''Sensor Data SLA Breach: '' || :v_staleness || '' minutes stale'',
+                ''SENSOR_READINGS data is '' || :v_staleness || '' minutes old (SLA: 120 min). Predictions may be stale. Check sensor feed pipeline.'',
+                ''SENSOR_READINGS''
+            );
+        EXCEPTION WHEN OTHER THEN NULL;
+        END;
+    END IF;
+    
+    RETURN ''Freshness check: '' || :v_status || '' ('' || :v_staleness || '' min)'';
+END;
+';
+CREATE OR REPLACE PROCEDURE "GENERATE_PURCHASE_ORDER"("P_ASSET_ID" VARCHAR, "P_PART_ID" VARCHAR, "P_QUANTITY" NUMBER(38,0), "P_REQUIRED_BY_DATE" DATE, "P_WO_ID" VARCHAR, "P_PRIORITY" VARCHAR)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+DECLARE
+    v_po_id VARCHAR; v_supplier_id VARCHAR DEFAULT NULL; v_supplier_name VARCHAR DEFAULT ''Unknown'';
+    v_lead_time NUMBER DEFAULT 7; v_unit_cost FLOAT DEFAULT 0; v_expected_arrival DATE;
+    v_existing_po VARCHAR DEFAULT NULL; v_rul_hours FLOAT DEFAULT NULL;
+    v_failure_mode VARCHAR DEFAULT NULL; v_risk VARCHAR DEFAULT ''UNKNOWN'';
+BEGIN
+    BEGIN
+        SELECT po.PO_ID INTO :v_existing_po
+        FROM MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES pol
+        JOIN MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS po ON pol.PO_ID = po.PO_ID
+        WHERE pol.PART_ID = :p_part_id AND pol.ASSET_ID = :p_asset_id
+          AND po.STATUS NOT IN (''cancelled'', ''received'') LIMIT 1;
+    EXCEPTION WHEN OTHER THEN v_existing_po := NULL;
+    END;
+    IF (:v_existing_po IS NOT NULL) THEN
+        RETURN OBJECT_CONSTRUCT(''status'', ''DUPLICATE'', ''existing_po_id'', :v_existing_po,
+            ''message'', ''Open PO already exists for this part and asset'');
+    END IF;
+    BEGIN
+        SELECT ps.SUPPLIER_ID, s.SUPPLIER_NAME, ps.STANDARD_LEAD_TIME_DAYS, ps.UNIT_COST
+        INTO :v_supplier_id, :v_supplier_name, :v_lead_time, :v_unit_cost
+        FROM MFGPULSE_DB.RAW_IT.PART_SUPPLIERS ps
+        JOIN MFGPULSE_DB.RAW_IT.SUPPLIERS s ON ps.SUPPLIER_ID = s.SUPPLIER_ID
+        WHERE ps.PART_ID = :p_part_id AND ps.PREFERRED_SUPPLIER = TRUE AND s.ACTIVE = TRUE LIMIT 1;
+    EXCEPTION WHEN OTHER THEN NULL;
+    END;
+    IF (:v_supplier_id IS NULL) THEN
+        BEGIN
+            SELECT ps.SUPPLIER_ID, s.SUPPLIER_NAME, ps.STANDARD_LEAD_TIME_DAYS, ps.UNIT_COST
+            INTO :v_supplier_id, :v_supplier_name, :v_lead_time, :v_unit_cost
+            FROM MFGPULSE_DB.RAW_IT.PART_SUPPLIERS ps
+            JOIN MFGPULSE_DB.RAW_IT.SUPPLIERS s ON ps.SUPPLIER_ID = s.SUPPLIER_ID
+            WHERE ps.PART_ID = :p_part_id AND s.ACTIVE = TRUE ORDER BY ps.UNIT_COST ASC LIMIT 1;
+        EXCEPTION WHEN OTHER THEN NULL;
+        END;
+    END IF;
+    v_expected_arrival := DATEADD(''day'', :v_lead_time, CURRENT_DATE());
+    BEGIN
+        SELECT RUL_HOURS, FAILURE_MODE_PRED INTO :v_rul_hours, :v_failure_mode
+        FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS WHERE ASSET_ID = :p_asset_id;
+    EXCEPTION WHEN OTHER THEN NULL;
+    END;
+    v_risk := CASE
+        WHEN :v_expected_arrival > DATEADD(''hour'', COALESCE(:v_rul_hours, 2000)::INTEGER, CURRENT_TIMESTAMP())::DATE THEN ''CRITICAL_SHORTAGE''
+        WHEN :v_expected_arrival > :p_required_by_date THEN ''EXPEDITE''
+        ELSE ''ORDER_NOW'' END;
+    v_po_id := ''PO-'' || TO_CHAR(CURRENT_DATE(), ''YYYYMMDD'') || ''-'' || :p_asset_id;
+    INSERT INTO MFGPULSE_DB.RAW_IT.PURCHASE_ORDERS
+        (PO_ID, SUPPLIER_ID, REQUIRED_BY_DATE, EXPECTED_ARRIVAL_DATE, STATUS, PRIORITY, TOTAL_COST, CREATED_BY, SOURCE)
+    VALUES (:v_po_id, :v_supplier_id, :p_required_by_date, :v_expected_arrival, ''pending_approval'',
+        COALESCE(:p_priority, ''NORMAL''), :v_unit_cost * :p_quantity, CURRENT_USER(), ''prediction'');
+    INSERT INTO MFGPULSE_DB.RAW_IT.PURCHASE_ORDER_LINES
+        (PO_LINE_ID, PO_ID, PART_ID, ASSET_ID, WO_ID, QUANTITY_ORDERED, UNIT_COST, LINE_COST,
+         RUL_HOURS_AT_ORDER, FAILURE_MODE_PRED, PROCUREMENT_RISK)
+    VALUES (:v_po_id || ''-L1'', :v_po_id, :p_part_id, :p_asset_id, :p_wo_id, :p_quantity,
+        :v_unit_cost, :v_unit_cost * :p_quantity, :v_rul_hours, :v_failure_mode, :v_risk);
+    BEGIN
+        CALL MFGPULSE_DB.RAW_IT.LOG_APP_NOTIFICATION(
+            ''PO_CREATED'', ''Purchase order created: '' || :v_po_id,
+            ''PO '' || :v_po_id || '' created for '' || :p_part_id || '' (asset: '' || :p_asset_id || ''). Supplier: '' || :v_supplier_name || ''. Cost: $'' || (:v_unit_cost * :p_quantity)::VARCHAR,
+            :v_po_id);
+    EXCEPTION WHEN OTHER THEN NULL;
+    END;
+    RETURN OBJECT_CONSTRUCT(''status'', ''CREATED'', ''po_id'', :v_po_id, ''supplier'', :v_supplier_name,
+        ''expected_arrival'', :v_expected_arrival::VARCHAR, ''procurement_risk'', :v_risk,
+        ''total_cost'', :v_unit_cost * :p_quantity);
+END;
+';
+CREATE OR REPLACE PROCEDURE "GENERATE_SHIFT_HANDOVER_SUMMARY"()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+BEGIN
+    LET data_context VARCHAR := (
+        SELECT OBJECT_CONSTRUCT(
+            ''plant_oee'', (SELECT PLANT_OEE FROM MFGPULSE_DB.ANALYTICS.EXECUTIVE_SUMMARY),
+            ''oee_target'', 85,
+            ''critical_assets'', (
+                SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
+                    ''name'', ASSET_NAME, ''failure_mode'', FAILURE_MODE_PRED, 
+                    ''rul_hours'', RUL_HOURS, ''stage'', STAGE_PRED,
+                    ''degradation'', ROUND(DEGRADATION_SCORE, 2),
+                    ''action_window'', ACTION_WINDOW,
+                    ''failure_cost'', ESTIMATED_FAILURE_COST,
+                    ''repair_cost'', PLANNED_REPAIR_COST,
+                    ''assigned_to'', WO_ASSIGNED_TO,
+                    ''wo_id'', OPEN_WO_ID,
+                    ''parts_status'', PARTS_STATUS
+                ))
+                FROM MFGPULSE_DB.ANALYTICS.PREDICTIONS_WITH_COST
+                WHERE RUL_HOURS < 200
+            ),
+            ''healthy_assets'', (
+                SELECT ARRAY_AGG(ASSET_NAME) 
+                FROM MFGPULSE_DB.ANALYTICS.PREDICTIONS_WITH_COST 
+                WHERE STAGE_PRED = ''Healthy''
+            ),
+            ''alert_summary'', (SELECT OBJECT_CONSTRUCT(''critical'', CRITICAL_COUNT, ''warning'', WARNING_COUNT, ''info'', INFO_COUNT) FROM MFGPULSE_DB.ANALYTICS.ALERT_SUMMARY),
+            ''auto_work_orders'', (SELECT COUNT(*) FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS WHERE WO_ID LIKE ''WO-AUTO%'' AND STATUS = ''open''),
+            ''cost_avoided'', (SELECT TOTAL_COST_AVOIDED FROM MFGPULSE_DB.ANALYTICS.COST_IMPACT),
+            ''maintenance_roi'', (SELECT MAINTENANCE_ROI_X FROM MFGPULSE_DB.ANALYTICS.COST_IMPACT)
+        )::VARCHAR
+    );
+
+    LET ai_summary VARCHAR := (
+        SELECT SNOWFLAKE.CORTEX.COMPLETE(
+            ''llama3.1-70b'',
+            ''You are a shift handover intelligence system for a manufacturing plant. Generate a concise, actionable shift handover briefing from this data. Use this exact format:
+
+SHIFT HANDOVER BRIEFING
+Generated: [current time]
+
+CRITICAL ACTIONS (do these first):
+[List assets with RUL < 72hrs. For each: asset name, failure mode, RUL, assigned technician, work order ID]
+
+WARNINGS (monitor closely):
+[List assets with RUL 72-200hrs. For each: asset name, risk, action window]
+
+PLANT STATUS:
+OEE: [current]% vs [target]% target | Gap: [diff]%
+Alerts: [critical] critical, [warning] warnings
+Active Work Orders: [count]
+
+HEALTHY ASSETS:
+[List healthy assets - all clear]
+
+COST INTELLIGENCE:
+Total cost avoided by early detection: $[amount]
+Maintenance ROI: [X]x return
+Cost of inaction on critical assets: $[sum of failure costs for critical]
+
+INCOMING SHIFT PRIORITIES:
+1. [Most urgent action]
+2. [Second priority]
+3. [Third priority]
+
+Keep it factual, use exact numbers from the data. No fluff. Every line should be actionable.
+
+DATA: '' || :data_context
+        )
+    );
+
+    RETURN :ai_summary;
+END;
+';
+CREATE OR REPLACE PROCEDURE "GENERATE_WORK_ORDER"("P_ASSET_ID" VARCHAR, "P_PRIORITY" VARCHAR, "P_ACTION" VARCHAR, "P_PARTS_NEEDED" VARCHAR, "P_ESTIMATED_COST" FLOAT)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+DECLARE
+    v_wo_id VARCHAR;
+    v_technician VARCHAR DEFAULT ''Unassigned'';
+    v_parts_available BOOLEAN DEFAULT FALSE;
+    v_line_id VARCHAR;
+BEGIN
+    -- Generate WO ID
+    v_wo_id := ''WO-AUTO-'' || TO_CHAR(CURRENT_TIMESTAMP(), ''YYYYMMDD-HH24MISS'');
+    
+    -- Get asset''s line
+    SELECT line_id INTO :v_line_id FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER WHERE asset_id = :p_asset_id;
+    
+    -- Find next available technician from shift schedule
+    BEGIN
+        SELECT operator_name INTO :v_technician
+        FROM MFGPULSE_DB.RAW_IT.SHIFT_SCHEDULE
+        WHERE line_id = :v_line_id AND shift_start > CURRENT_TIMESTAMP()
+        ORDER BY shift_start LIMIT 1;
+    EXCEPTION WHEN OTHER THEN v_technician := ''Next available technician'';
+    END;
+    
+    -- Check parts availability
+    BEGIN
+        SELECT COUNT(*) > 0 INTO :v_parts_available
+        FROM MFGPULSE_DB.RAW_IT.PARTS_INVENTORY
+        WHERE ARRAY_CONTAINS(:p_asset_id::VARIANT, compatible_assets)
+            AND quantity_on_hand > 0;
+    EXCEPTION WHEN OTHER THEN v_parts_available := FALSE;
+    END;
+    
+    -- Insert work order
+    INSERT INTO MFGPULSE_DB.RAW_IT.WORK_ORDERS 
+    (wo_id, asset_id, wo_type, created_date, priority, status, assigned_to, parts_cost)
+    VALUES (
+        :v_wo_id, :p_asset_id, 
+        CASE WHEN :p_priority = ''EMERGENCY'' THEN ''emergency'' ELSE ''corrective'' END,
+        CURRENT_TIMESTAMP(), :p_priority, ''open'', :v_technician, :p_estimated_cost
+    );
+    
+    RETURN OBJECT_CONSTRUCT(
+        ''wo_id'', :v_wo_id,
+        ''asset_id'', :p_asset_id,
+        ''priority'', :p_priority,
+        ''status'', ''open'',
+        ''action'', :p_action,
+        ''assigned_to'', :v_technician,
+        ''parts_needed'', :p_parts_needed,
+        ''parts_available'', :v_parts_available,
+        ''estimated_cost'', :p_estimated_cost,
+        ''created_at'', CURRENT_TIMESTAMP()::VARCHAR,
+        ''message'', ''Work order '' || :v_wo_id || '' created for '' || :p_asset_id || ''. Assigned to: '' || :v_technician
+    );
+END;
+';
+CREATE OR REPLACE PROCEDURE "REFRESH_ALL_DTS"()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+BEGIN
+    -- Layer 0: Raw → Curated
+    ALTER DYNAMIC TABLE MFGPULSE_DB.CURATED.SENSOR_WITH_CONTEXT REFRESH;
+    ALTER DYNAMIC TABLE MFGPULSE_DB.CURATED.ASSET_HEALTH_CURRENT REFRESH;
+    ALTER DYNAMIC TABLE MFGPULSE_DB.CURATED.FAILURE_HISTORY REFRESH;
+    -- Layer 1: Raw → Features
+    ALTER DYNAMIC TABLE MFGPULSE_DB.ML_FEATURES.ROLLING_STATS REFRESH;
+    ALTER DYNAMIC TABLE MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE REFRESH;
+    ALTER DYNAMIC TABLE MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS REFRESH;
+    ALTER DYNAMIC TABLE MFGPULSE_DB.ML_FEATURES.LABELED_DATA REFRESH;
+    -- Layer 2: Features → Advanced features
+    ALTER DYNAMIC TABLE MFGPULSE_DB.ML_FEATURES.TEMPORAL_MEMORY REFRESH;
+    ALTER DYNAMIC TABLE MFGPULSE_DB.ML_FEATURES.FLEET_COMPARISON REFRESH;
+    ALTER DYNAMIC TABLE MFGPULSE_DB.ML_FEATURES.CROSS_DOMAIN REFRESH;
+    -- Layer 3: Features + Fatigue → Predictions
+    ALTER DYNAMIC TABLE MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS REFRESH;
+    -- Layer 4: Predictions → Business
+    ALTER DYNAMIC TABLE MFGPULSE_DB.ANALYTICS.ACTIVE_ALERTS REFRESH;
+    ALTER DYNAMIC TABLE MFGPULSE_DB.ANALYTICS.OEE_METRICS REFRESH;
+    RETURN ''All 13 DTs refreshed at '' || CURRENT_TIMESTAMP()::VARCHAR;
+END;
+';
+CREATE OR REPLACE PROCEDURE "RESERVE_PART_FOR_WORK_ORDER"("P_ASSET_ID" VARCHAR, "P_WO_ID" VARCHAR, "P_PART_ID" VARCHAR, "P_QUANTITY" NUMBER(38,0), "P_REQUIRED_BY_DATE" DATE)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+DECLARE v_atp NUMBER; v_res_id VARCHAR;
+BEGIN
+    SELECT AVAILABLE_TO_PROMISE INTO :v_atp FROM MFGPULSE_DB.ANALYTICS.PARTS_AVAILABLE_TO_PROMISE WHERE PART_ID = :p_part_id;
+    IF (:v_atp < :p_quantity) THEN
+        RETURN OBJECT_CONSTRUCT(''status'', ''REJECTED'', ''reason'', ''Insufficient ATP: '' || :v_atp || '' available'', ''available_to_promise'', :v_atp);
+    END IF;
+    v_res_id := ''RES-'' || TO_CHAR(CURRENT_TIMESTAMP(), ''YYYYMMDD-HH24MISS'') || ''-'' || :p_asset_id;
+    INSERT INTO MFGPULSE_DB.RAW_IT.PART_RESERVATIONS
+        (RESERVATION_ID, PART_ID, ASSET_ID, WO_ID, QUANTITY_RESERVED, REQUIRED_BY_DATE, STATUS)
+    VALUES (:v_res_id, :p_part_id, :p_asset_id, :p_wo_id, :p_quantity, :p_required_by_date, ''active'');
+    RETURN OBJECT_CONSTRUCT(''status'', ''RESERVED'', ''reservation_id'', :v_res_id, ''quantity'', :p_quantity, ''remaining_atp'', :v_atp - :p_quantity);
+END;
+';
+CREATE OR REPLACE PROCEDURE "SNAPSHOT_KPIS"()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+BEGIN
+    DELETE FROM MFGPULSE_DB.ANALYTICS.KPI_SNAPSHOTS WHERE SNAPSHOT_DATE = CURRENT_DATE();
+    
+    INSERT INTO MFGPULSE_DB.ANALYTICS.KPI_SNAPSHOTS
+        (SNAPSHOT_DATE, PLANT_OEE, CRITICAL_ASSETS, WARNING_ASSETS, HEALTHY_ASSETS,
+         TOTAL_COST_AVOIDED, DOWNTIME_HOURS_PREVENTED, MAINTENANCE_ROI_X,
+         TOTAL_ALERTS, CRITICAL_ALERTS, AVG_EARLY_DETECTION_DAYS, TOTAL_MAINTENANCE_SPEND)
+    SELECT 
+        CURRENT_DATE(),
+        e.PLANT_OEE, e.CRITICAL_ASSETS, e.WARNING_ASSETS, e.HEALTHY_ASSETS,
+        e.TOTAL_COST_AVOIDED, e.DOWNTIME_HOURS_PREVENTED, e.MAINTENANCE_ROI_X,
+        a.TOTAL_ALERTS, a.CRITICAL_COUNT,
+        e.AVG_EARLY_DETECTION_DAYS, e.TOTAL_MAINTENANCE_SPEND
+    FROM MFGPULSE_DB.ANALYTICS.EXECUTIVE_SUMMARY e
+    CROSS JOIN MFGPULSE_DB.ANALYTICS.ALERT_SUMMARY a;
+    
+    RETURN ''KPI snapshot captured for '' || CURRENT_DATE()::VARCHAR;
+END;
+';
+create or replace task DAG_ARCHIVE_ALERTS
+	warehouse=MFGPULSE_AUTOMATION_WH
+	after MFGPULSE_DB.ANALYTICS.DAG_REFRESH_DTS
+	as CALL MFGPULSE_DB.ANALYTICS.ARCHIVE_ALERTS();
+create or replace task DAG_CHECK_DRIFT
+	warehouse=MFGPULSE_AUTOMATION_WH
+	after MFGPULSE_DB.ANALYTICS.DAG_REFRESH_DTS
+	as CALL MFGPULSE_DB.ML_MODELS.COMPUTE_NATIVE_PREDICTIONS();
+create or replace task DAG_CHECK_FRESHNESS
+	warehouse=MFGPULSE_AUTOMATION_WH
+	after MFGPULSE_DB.ANALYTICS.MFGPULSE_AUTOMATION_DAG
+	as CALL MFGPULSE_DB.ANALYTICS.CHECK_DATA_FRESHNESS();
+create or replace task DAG_CONVERT_PPOS
+	warehouse=MFGPULSE_AUTOMATION_WH
+	after MFGPULSE_DB.ANALYTICS.DAG_GENERATE_POS
+	as CALL MFGPULSE_DB.ANALYTICS.AUTO_CONVERT_PLANNED_POS();
+create or replace task DAG_GENERATE_POS
+	warehouse=MFGPULSE_AUTOMATION_WH
+	after MFGPULSE_DB.ANALYTICS.DAG_GENERATE_WOS
+	as CALL MFGPULSE_DB.ANALYTICS.AUTO_GENERATE_PURCHASE_ORDERS();
+create or replace task DAG_GENERATE_WOS
+	warehouse=MFGPULSE_AUTOMATION_WH
+	after MFGPULSE_DB.ANALYTICS.DAG_REFRESH_DTS
+	as CALL MFGPULSE_DB.ANALYTICS.AUTO_GENERATE_WORK_ORDERS();
+create or replace task DAG_REFRESH_DTS
+	warehouse=MFGPULSE_AUTOMATION_WH
+	after MFGPULSE_DB.ANALYTICS.DAG_REFRESH_FATIGUE
+	as CALL MFGPULSE_DB.ANALYTICS.REFRESH_ALL_DTS();
+create or replace task DAG_REFRESH_FATIGUE
+	warehouse=MFGPULSE_AUTOMATION_WH
+	after MFGPULSE_DB.ANALYTICS.MFGPULSE_AUTOMATION_DAG
+	as CALL MFGPULSE_DB.ML_MODELS.REFRESH_FATIGUE_SCORES();
+create or replace task DAG_SNAPSHOT_KPIS
+	warehouse=MFGPULSE_AUTOMATION_WH
+	after MFGPULSE_DB.ANALYTICS.DAG_CONVERT_PPOS
+	as CALL MFGPULSE_DB.ANALYTICS.SNAPSHOT_KPIS();
+create or replace task MFGPULSE_AUTOMATION_DAG
+	warehouse=MFGPULSE_AUTOMATION_WH
+	schedule='720 MINUTE'
+	SUSPEND_TASK_AFTER_NUM_FAILURES=2
+	as CALL MFGPULSE_DB.RAW_OT.SIMULATE_ALL_FEEDS_RANDOM();
+create or replace schema CURATED;
+
+create or replace dynamic table ASSET_HEALTH_CURRENT(
+	ASSET_ID,
+	ASSET_NAME,
+	ASSET_TYPE,
+	LINE_ID,
+	LAST_READING_TIME,
+	CURRENT_VIB_X,
+	CURRENT_VIB_Y,
+	CURRENT_VIB_Z,
+	CURRENT_VIB_MAGNITUDE,
+	CURRENT_TEMPERATURE,
+	CURRENT_RPM,
+	CURRENT_PRESSURE,
+	CURRENT_AMPS,
+	CURRENT_ACOUSTIC_DB,
+	AVG_VIB_MAG_24H,
+	AVG_TEMP_24H,
+	AVG_RPM_24H,
+	AVG_CURRENT_24H,
+	STD_VIB_X_24H,
+	STD_TEMP_24H,
+	MAX_VIB_MAG_24H,
+	HEALTH_SCORE
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH latest_readings AS (
+    SELECT *,
+        ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn
+    FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS
+),
+recent_stats AS (
+    SELECT 
+        asset_id,
+        AVG(vibration_x) AS avg_vib_x_24h,
+        AVG(vibration_y) AS avg_vib_y_24h,
+        AVG(vibration_z) AS avg_vib_z_24h,
+        AVG(SQRT(POWER(vibration_x,2)+POWER(vibration_y,2)+POWER(vibration_z,2))) AS avg_vib_mag_24h,
+        AVG(temperature) AS avg_temp_24h,
+        AVG(rpm) AS avg_rpm_24h,
+        AVG(current_amps) AS avg_current_24h,
+        STDDEV(vibration_x) AS std_vib_x_24h,
+        STDDEV(temperature) AS std_temp_24h,
+        MAX(SQRT(POWER(vibration_x,2)+POWER(vibration_y,2)+POWER(vibration_z,2))) AS max_vib_mag_24h
+    FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS
+    WHERE timestamp >= DATEADD('hour', -24, (SELECT MAX(timestamp) FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS))
+    GROUP BY asset_id
+)
+SELECT 
+    lr.asset_id,
+    am.asset_name,
+    am.asset_type,
+    am.line_id,
+    lr.timestamp AS last_reading_time,
+    lr.vibration_x AS current_vib_x,
+    lr.vibration_y AS current_vib_y,
+    lr.vibration_z AS current_vib_z,
+    SQRT(POWER(lr.vibration_x,2)+POWER(lr.vibration_y,2)+POWER(lr.vibration_z,2)) AS current_vib_magnitude,
+    lr.temperature AS current_temperature,
+    lr.rpm AS current_rpm,
+    lr.pressure AS current_pressure,
+    lr.current_amps AS current_amps,
+    lr.acoustic_db AS current_acoustic_db,
+    rs.avg_vib_mag_24h,
+    rs.avg_temp_24h,
+    rs.avg_rpm_24h,
+    rs.avg_current_24h,
+    rs.std_vib_x_24h,
+    rs.std_temp_24h,
+    rs.max_vib_mag_24h,
+    -- Simple health score (0-100, lower = worse)
+    GREATEST(0, LEAST(100,
+        100 
+        - CASE WHEN SQRT(POWER(lr.vibration_x,2)+POWER(lr.vibration_y,2)+POWER(lr.vibration_z,2)) > 7 THEN 40
+               WHEN SQRT(POWER(lr.vibration_x,2)+POWER(lr.vibration_y,2)+POWER(lr.vibration_z,2)) > 4 THEN 20
+               WHEN SQRT(POWER(lr.vibration_x,2)+POWER(lr.vibration_y,2)+POWER(lr.vibration_z,2)) > 2.5 THEN 10
+               ELSE 0 END
+        - CASE WHEN lr.temperature / NULLIF(am.rated_temp_max,0) > 0.9 THEN 30
+               WHEN lr.temperature / NULLIF(am.rated_temp_max,0) > 0.75 THEN 15
+               ELSE 0 END
+        - CASE WHEN rs.std_vib_x_24h > 3 THEN 20
+               WHEN rs.std_vib_x_24h > 1.5 THEN 10
+               ELSE 0 END
+    )) AS health_score
+FROM latest_readings lr
+JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON lr.asset_id = am.asset_id
+LEFT JOIN recent_stats rs ON lr.asset_id = rs.asset_id
+WHERE lr.rn = 1;
+create or replace dynamic table FAILURE_HISTORY(
+	WO_ID,
+	ASSET_ID,
+	FAILURE_DATE,
+	WO_TYPE,
+	PRIORITY,
+	TOTAL_COST,
+	PRE_FAIL_AVG_VIB_X,
+	PRE_FAIL_AVG_VIB_Y,
+	PRE_FAIL_AVG_VIB_Z,
+	PRE_FAIL_AVG_VIB_MAG,
+	PRE_FAIL_MAX_VIB_MAG,
+	PRE_FAIL_AVG_TEMP,
+	PRE_FAIL_MAX_TEMP,
+	PRE_FAIL_AVG_CURRENT,
+	PRE_FAIL_MAX_CURRENT,
+	PRE_FAIL_AVG_ACOUSTIC,
+	PRE_FAIL_STD_VIB_X,
+	PRE_FAIL_STD_TEMP,
+	READINGS_IN_WINDOW,
+	ASSET_NAME,
+	ASSET_TYPE,
+	LINE_ID,
+	FAILURE_NOTES
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH failure_events AS (
+    SELECT 
+        wo_id,
+        asset_id,
+        created_date AS failure_date,
+        wo_type,
+        priority,
+        total_cost
+    FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS
+    WHERE wo_type IN ('emergency', 'corrective')
+),
+pre_failure_stats AS (
+    SELECT 
+        fe.wo_id,
+        fe.asset_id,
+        fe.failure_date,
+        fe.wo_type,
+        fe.priority,
+        fe.total_cost,
+        -- Stats from 7 days before failure
+        AVG(sr.vibration_x) AS pre_fail_avg_vib_x,
+        AVG(sr.vibration_y) AS pre_fail_avg_vib_y,
+        AVG(sr.vibration_z) AS pre_fail_avg_vib_z,
+        AVG(SQRT(POWER(sr.vibration_x,2)+POWER(sr.vibration_y,2)+POWER(sr.vibration_z,2))) AS pre_fail_avg_vib_mag,
+        MAX(SQRT(POWER(sr.vibration_x,2)+POWER(sr.vibration_y,2)+POWER(sr.vibration_z,2))) AS pre_fail_max_vib_mag,
+        AVG(sr.temperature) AS pre_fail_avg_temp,
+        MAX(sr.temperature) AS pre_fail_max_temp,
+        AVG(sr.current_amps) AS pre_fail_avg_current,
+        MAX(sr.current_amps) AS pre_fail_max_current,
+        AVG(sr.acoustic_db) AS pre_fail_avg_acoustic,
+        STDDEV(sr.vibration_x) AS pre_fail_std_vib_x,
+        STDDEV(sr.temperature) AS pre_fail_std_temp,
+        COUNT(sr.reading_id) AS readings_in_window
+    FROM failure_events fe
+    JOIN MFGPULSE_DB.RAW_OT.SENSOR_READINGS sr 
+        ON fe.asset_id = sr.asset_id 
+        AND sr.timestamp BETWEEN DATEADD('day', -7, fe.failure_date) AND fe.failure_date
+    GROUP BY fe.wo_id, fe.asset_id, fe.failure_date, fe.wo_type, fe.priority, fe.total_cost
+)
+SELECT 
+    pfs.*,
+    am.asset_name,
+    am.asset_type,
+    am.line_id,
+    ml.notes_text AS failure_notes
+FROM pre_failure_stats pfs
+JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON pfs.asset_id = am.asset_id
+LEFT JOIN MFGPULSE_DB.RAW_IT.MAINTENANCE_LOGS ml ON pfs.wo_id = ml.wo_id
+    AND ml.log_id = (
+        SELECT MIN(log_id) FROM MFGPULSE_DB.RAW_IT.MAINTENANCE_LOGS 
+        WHERE wo_id = pfs.wo_id
+    );
+create or replace dynamic table SENSOR_WITH_CONTEXT(
+	READING_ID,
+	ASSET_ID,
+	ASSET_NAME,
+	ASSET_TYPE,
+	LINE_ID,
+	TIMESTAMP,
+	VIBRATION_X,
+	VIBRATION_Y,
+	VIBRATION_Z,
+	VIBRATION_MAGNITUDE,
+	TEMPERATURE,
+	RPM,
+	PRESSURE,
+	CURRENT_AMPS,
+	ACOUSTIC_DB,
+	RATED_RPM,
+	RATED_TEMP_MAX,
+	TEMP_RATIO_TO_MAX,
+	RPM_RATIO_TO_RATED,
+	LAST_MAINTENANCE_DATE,
+	HOURS_SINCE_LAST_MAINTENANCE
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+SELECT 
+    sr.reading_id,
+    sr.asset_id,
+    am.asset_name,
+    am.asset_type,
+    am.line_id,
+    sr.timestamp,
+    sr.vibration_x,
+    sr.vibration_y,
+    sr.vibration_z,
+    SQRT(POWER(sr.vibration_x,2) + POWER(sr.vibration_y,2) + POWER(sr.vibration_z,2)) AS vibration_magnitude,
+    sr.temperature,
+    sr.rpm,
+    sr.pressure,
+    sr.current_amps,
+    sr.acoustic_db,
+    am.rated_rpm,
+    am.rated_temp_max,
+    sr.temperature / NULLIF(am.rated_temp_max, 0) AS temp_ratio_to_max,
+    sr.rpm / NULLIF(am.rated_rpm, 0) AS rpm_ratio_to_rated,
+    lm.last_maintenance_date,
+    DATEDIFF('hour', lm.last_maintenance_date, sr.timestamp) AS hours_since_last_maintenance
+FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS sr
+JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON sr.asset_id = am.asset_id
+LEFT JOIN (
+    SELECT asset_id, MAX(completed_date) AS last_maintenance_date
+    FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS
+    WHERE status = 'completed'
+    GROUP BY asset_id
+) lm ON sr.asset_id = lm.asset_id;
+create or replace schema ML_FEATURES;
+
+create or replace dynamic table CROSS_DOMAIN(
+	ASSET_ID,
+	TIMESTAMP,
+	DAYS_SINCE_LAST_MAINTENANCE,
+	CUMULATIVE_OPERATING_HOURS,
+	HISTORICAL_FAILURE_COUNT,
+	MAINTENANCE_EFFECTIVENESS,
+	TEMP_DEVIATION_FROM_SPEC,
+	RPM_DEVIATION_FROM_SPEC,
+	WORKLOAD_INTENSITY_7D,
+	CUMULATIVE_MAINTENANCE_COST,
+	WO_FREQUENCY_PER_1000H
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH last_maintenance AS (
+    SELECT 
+        asset_id,
+        MAX(CASE WHEN status = 'completed' THEN completed_date END) AS last_maint_date,
+        COUNT(*) AS total_wo_count,
+        COUNT(CASE WHEN wo_type = 'emergency' THEN 1 END) AS emergency_count,
+        COUNT(CASE WHEN wo_type = 'corrective' THEN 1 END) AS corrective_count,
+        SUM(total_cost) AS total_historical_cost
+    FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS
+    GROUP BY asset_id
+),
+-- Get vibration before/after last completed repair for maintenance effectiveness
+maint_effectiveness AS (
+    SELECT 
+        wo.asset_id,
+        wo.wo_id,
+        wo.completed_date,
+        AVG(CASE WHEN sr.timestamp BETWEEN DATEADD('day', -3, wo.created_date) AND wo.created_date 
+            THEN SQRT(POWER(sr.vibration_x,2)+POWER(sr.vibration_y,2)+POWER(sr.vibration_z,2)) END) AS vib_before,
+        AVG(CASE WHEN sr.timestamp BETWEEN wo.completed_date AND DATEADD('day', 3, wo.completed_date) 
+            THEN SQRT(POWER(sr.vibration_x,2)+POWER(sr.vibration_y,2)+POWER(sr.vibration_z,2)) END) AS vib_after
+    FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS wo
+    JOIN MFGPULSE_DB.RAW_OT.SENSOR_READINGS sr ON wo.asset_id = sr.asset_id
+    WHERE wo.status = 'completed' AND wo.completed_date IS NOT NULL
+    GROUP BY wo.asset_id, wo.wo_id, wo.completed_date
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY wo.asset_id ORDER BY wo.completed_date DESC) = 1
+),
+production_intensity AS (
+    SELECT 
+        asset_id,
+        AVG(units_produced) AS avg_production_7d
+    FROM MFGPULSE_DB.RAW_IT.PRODUCTION_OUTPUT
+    WHERE timestamp >= DATEADD('day', -7, (SELECT MAX(timestamp) FROM MFGPULSE_DB.RAW_IT.PRODUCTION_OUTPUT))
+    GROUP BY asset_id
+),
+readings AS (
+    SELECT 
+        asset_id, timestamp,
+        SQRT(POWER(vibration_x,2)+POWER(vibration_y,2)+POWER(vibration_z,2)) AS vib_mag,
+        temperature, rpm, current_amps
+    FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS
+)
+SELECT 
+    r.asset_id,
+    r.timestamp,
+    
+    -- 1. Days since last maintenance
+    DATEDIFF('day', lm.last_maint_date, r.timestamp) AS days_since_last_maintenance,
+    
+    -- 2. Cumulative operating hours (since install)
+    DATEDIFF('hour', am.install_date, r.timestamp) AS cumulative_operating_hours,
+    
+    -- 3. Historical failure count (chronic vs one-off)
+    lm.emergency_count + lm.corrective_count AS historical_failure_count,
+    
+    -- 4. Maintenance effectiveness (vib_after / vib_before last repair)
+    me.vib_after / NULLIF(me.vib_before, 0) AS maintenance_effectiveness,
+    
+    -- 5. Operating deviation from spec: temperature
+    r.temperature / NULLIF(am.rated_temp_max, 0) AS temp_deviation_from_spec,
+    
+    -- 6. Operating deviation from spec: RPM
+    r.rpm / NULLIF(am.rated_rpm, 0) AS rpm_deviation_from_spec,
+    
+    -- 7. Workload intensity (7-day avg production)
+    pi.avg_production_7d / 192.0 AS workload_intensity_7d,  -- normalized to max capacity
+    
+    -- 8. Total historical maintenance cost (indicates chronic problem asset)
+    lm.total_historical_cost AS cumulative_maintenance_cost,
+    
+    -- 9. Work order frequency (WOs per 1000 operating hours)
+    lm.total_wo_count / NULLIF(DATEDIFF('hour', am.install_date, r.timestamp) / 1000.0, 0) AS wo_frequency_per_1000h
+
+FROM readings r
+JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON r.asset_id = am.asset_id
+LEFT JOIN last_maintenance lm ON r.asset_id = lm.asset_id
+LEFT JOIN maint_effectiveness me ON r.asset_id = me.asset_id
+LEFT JOIN production_intensity pi ON r.asset_id = pi.asset_id;
+create or replace dynamic table FLEET_COMPARISON(
+	ASSET_ID,
+	READING_DATE,
+	VIB_ZSCORE_VS_FLEET,
+	TEMP_ZSCORE_VS_FLEET,
+	VIB_PERCENTILE_IN_FLEET,
+	VIB_RATIO_TO_FLEET_MEAN,
+	IS_WORST_IN_FLEET
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH daily_asset_stats AS (
+    SELECT 
+        sr.asset_id,
+        am.asset_type,
+        DATE_TRUNC('day', sr.timestamp) AS reading_date,
+        AVG(SQRT(POWER(sr.vibration_x,2)+POWER(sr.vibration_y,2)+POWER(sr.vibration_z,2))) AS daily_avg_vib,
+        AVG(sr.temperature) AS daily_avg_temp,
+        AVG(sr.current_amps) AS daily_avg_current,
+        MAX(SQRT(POWER(sr.vibration_x,2)+POWER(sr.vibration_y,2)+POWER(sr.vibration_z,2))) AS daily_max_vib
+    FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS sr
+    JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON sr.asset_id = am.asset_id
+    GROUP BY sr.asset_id, am.asset_type, DATE_TRUNC('day', sr.timestamp)
+),
+fleet_stats AS (
+    SELECT 
+        asset_type,
+        reading_date,
+        AVG(daily_avg_vib) AS fleet_avg_vib,
+        STDDEV(daily_avg_vib) AS fleet_std_vib,
+        AVG(daily_avg_temp) AS fleet_avg_temp,
+        STDDEV(daily_avg_temp) AS fleet_std_temp,
+        AVG(daily_avg_current) AS fleet_avg_current
+    FROM daily_asset_stats
+    GROUP BY asset_type, reading_date
+)
+SELECT 
+    das.asset_id,
+    das.reading_date,
+    
+    -- 1. Vibration Z-score vs fleet peers (same asset type)
+    (das.daily_avg_vib - fs.fleet_avg_vib) / NULLIF(fs.fleet_std_vib, 0) AS vib_zscore_vs_fleet,
+    
+    -- 2. Temperature Z-score vs fleet peers
+    (das.daily_avg_temp - fs.fleet_avg_temp) / NULLIF(fs.fleet_std_temp, 0) AS temp_zscore_vs_fleet,
+    
+    -- 3. Percentile rank within fleet (0-1, higher = worse)
+    PERCENT_RANK() OVER (PARTITION BY das.asset_type, das.reading_date ORDER BY das.daily_avg_vib) AS vib_percentile_in_fleet,
+    
+    -- 4. Deviation from fleet mean (ratio)
+    das.daily_avg_vib / NULLIF(fs.fleet_avg_vib, 0) AS vib_ratio_to_fleet_mean,
+    
+    -- 5. Is this the worst performer in its type today?
+    CASE WHEN das.daily_max_vib = MAX(das.daily_max_vib) OVER (PARTITION BY das.asset_type, das.reading_date)
+        THEN 1 ELSE 0 END AS is_worst_in_fleet
+
+FROM daily_asset_stats das
+JOIN fleet_stats fs ON das.asset_type = fs.asset_type AND das.reading_date = fs.reading_date;
+create or replace dynamic table LABELED_DATA(
+	ASSET_ID,
+	TIMESTAMP,
+	FAILURE_MODE,
+	HOURS_TO_FAILURE,
+	IS_FAILURE_EVENT,
+	DEGRADATION_STAGE,
+	FAILURE_SEVERITY,
+	IS_DEGRADING
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH failure_events AS (
+    -- Get the emergency/corrective failure dates per asset
+    SELECT 
+        asset_id,
+        MIN(CASE WHEN wo_type = 'emergency' THEN created_date END) AS first_emergency_date,
+        MIN(CASE WHEN wo_type IN ('emergency','corrective') THEN created_date END) AS first_failure_date
+    FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS
+    WHERE wo_type IN ('emergency', 'corrective')
+    GROUP BY asset_id
+),
+asset_failure_modes AS (
+    SELECT asset_id,
+        CASE asset_id
+            WHEN 'ASSET_001' THEN 'bearing_wear'
+            WHEN 'ASSET_002' THEN 'thermal_degradation'
+            WHEN 'ASSET_003' THEN 'imbalance'
+            WHEN 'ASSET_004' THEN 'misalignment'
+            WHEN 'ASSET_005' THEN 'bearing_wear'
+            WHEN 'ASSET_006' THEN 'thermal_degradation'
+            WHEN 'ASSET_007' THEN 'normal'
+            WHEN 'ASSET_008' THEN 'imbalance'
+            WHEN 'ASSET_009' THEN 'misalignment'
+            WHEN 'ASSET_010' THEN 'normal'
+        END AS failure_mode
+    FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER
+),
+readings AS (
+    SELECT 
+        sr.asset_id,
+        sr.timestamp,
+        SQRT(POWER(sr.vibration_x,2)+POWER(sr.vibration_y,2)+POWER(sr.vibration_z,2)) AS vib_mag,
+        sr.temperature,
+        am.rated_temp_max
+    FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS sr
+    JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON sr.asset_id = am.asset_id
+)
+SELECT 
+    r.asset_id,
+    r.timestamp,
+    
+    -- Failure mode label
+    afm.failure_mode,
+    
+    -- Hours to failure (RUL) — NULL for healthy assets
+    CASE 
+        WHEN fe.first_failure_date IS NOT NULL AND r.timestamp < fe.first_failure_date
+        THEN DATEDIFF('hour', r.timestamp, fe.first_failure_date)
+        ELSE NULL
+    END AS hours_to_failure,
+    
+    -- Is this the failure event moment?
+    CASE 
+        WHEN fe.first_emergency_date IS NOT NULL 
+         AND ABS(DATEDIFF('minute', r.timestamp, fe.first_emergency_date)) < 15
+        THEN TRUE ELSE FALSE
+    END AS is_failure_event,
+    
+    -- Degradation stage (0-4)
+    CASE 
+        WHEN afm.failure_mode = 'normal' THEN 0
+        WHEN fe.first_failure_date IS NULL THEN 0
+        WHEN r.timestamp >= fe.first_failure_date THEN 4  -- Failed
+        WHEN DATEDIFF('hour', r.timestamp, fe.first_failure_date) < 24 THEN 4    -- Imminent
+        WHEN DATEDIFF('hour', r.timestamp, fe.first_failure_date) < 72 THEN 3    -- Critical
+        WHEN DATEDIFF('hour', r.timestamp, fe.first_failure_date) < 336 THEN 2   -- Warning (14 days)
+        WHEN DATEDIFF('hour', r.timestamp, fe.first_failure_date) < 720 THEN 1   -- Early (30 days)
+        ELSE 0  -- Healthy
+    END AS degradation_stage,
+    
+    -- Failure severity (what happens when it fails)
+    CASE 
+        WHEN afm.failure_mode = 'normal' THEN 'none'
+        WHEN fe.first_emergency_date IS NOT NULL THEN 'emergency'
+        WHEN fe.first_failure_date IS NOT NULL THEN 'corrective'
+        ELSE 'none'
+    END AS failure_severity,
+    
+    -- Binary: is asset currently in degrading state?
+    CASE 
+        WHEN afm.failure_mode != 'normal' 
+         AND fe.first_failure_date IS NOT NULL 
+         AND r.timestamp < fe.first_failure_date
+         AND DATEDIFF('hour', r.timestamp, fe.first_failure_date) < 720
+        THEN 1 ELSE 0
+    END AS is_degrading
+
+FROM readings r
+JOIN asset_failure_modes afm ON r.asset_id = afm.asset_id
+LEFT JOIN failure_events fe ON r.asset_id = fe.asset_id;
+create or replace dynamic table PHYSICS_COMPOSITE(
+	ASSET_ID,
+	TIMESTAMP,
+	MECHANICAL_POWER_PROXY,
+	THERMAL_EFFICIENCY,
+	ISO_10816_SEVERITY,
+	BEARING_DEFECT_INDICATOR,
+	ENERGY_BALANCE_RATIO,
+	STRESS_INDEX,
+	OPERATING_REGIME,
+	COMPOSITE_HEALTH_SCORE
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH base AS (
+    SELECT 
+        sr.asset_id,
+        sr.timestamp,
+        sr.vibration_x, sr.vibration_y, sr.vibration_z,
+        SQRT(POWER(sr.vibration_x,2)+POWER(sr.vibration_y,2)+POWER(sr.vibration_z,2)) AS vib_mag,
+        sr.temperature,
+        sr.rpm,
+        sr.current_amps,
+        sr.acoustic_db,
+        sr.pressure,
+        am.rated_rpm,
+        am.rated_temp_max,
+        ROW_NUMBER() OVER (PARTITION BY sr.asset_id ORDER BY sr.timestamp) AS rn
+    FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS sr
+    JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON sr.asset_id = am.asset_id
+)
+SELECT 
+    asset_id,
+    timestamp,
+    
+    -- 1. Mechanical Power Proxy = torque * speed ≈ current * rpm
+    current_amps * rpm AS mechanical_power_proxy,
+    
+    -- 2. Thermal Efficiency = useful work / heat generated
+    (current_amps * rpm) / NULLIF(temperature, 0) AS thermal_efficiency,
+    
+    -- 3. Vibration Severity per ISO 10816 (RMS velocity in mm/s)
+    --    Good: <2.8, Satisfactory: 2.8-7.1, Unsatisfactory: 7.1-18, Unacceptable: >18
+    CASE 
+        WHEN vib_mag < 2.8 THEN 1   -- Good
+        WHEN vib_mag < 7.1 THEN 2   -- Satisfactory  
+        WHEN vib_mag < 18.0 THEN 3  -- Unsatisfactory
+        ELSE 4                       -- Unacceptable
+    END AS iso_10816_severity,
+    
+    -- 4. Bearing Defect Frequency Indicator
+    --    Approximated: high kurtosis in vib + increasing acoustic = bearing defect
+    (vib_mag * acoustic_db) / NULLIF(rpm, 0) AS bearing_defect_indicator,
+    
+    -- 5. Energy Balance Ratio = output energy proxy / input energy proxy
+    --    Divergence from 1.0 indicates energy loss (friction, misalignment)
+    (pressure * rpm) / NULLIF(current_amps * 100, 0) AS energy_balance_ratio,
+    
+    -- 6. Stress Index = multi-factor stress on asset
+    (temperature / NULLIF(rated_temp_max, 0)) * 0.3 +
+    (vib_mag / 7.1) * 0.4 +  -- normalized to ISO boundary
+    (current_amps / 15.0) * 0.3 AS stress_index,
+    
+    -- 7. Operating Regime (categorical: low/normal/high/overload)
+    CASE 
+        WHEN rpm < rated_rpm * 0.7 THEN 0   -- Low load
+        WHEN rpm < rated_rpm * 0.95 THEN 1  -- Normal
+        WHEN rpm < rated_rpm * 1.05 THEN 2  -- High load
+        ELSE 3                               -- Overload
+    END AS operating_regime,
+    
+    -- 8. Composite Health Score (weighted multi-signal)
+    GREATEST(0, LEAST(100,
+        100.0
+        - GREATEST(0, (vib_mag - 2.5)) * 8.0       -- vibration penalty
+        - GREATEST(0, (temperature / NULLIF(rated_temp_max,0) - 0.7)) * 80.0  -- temp penalty
+        - GREATEST(0, (current_amps - 13.0)) * 5.0  -- current penalty
+        - GREATEST(0, (acoustic_db - 75.0)) * 2.0   -- acoustic penalty
+    )) AS composite_health_score
+
+FROM base;
+create or replace dynamic table ROLLING_STATS(
+	ASSET_ID,
+	TIMESTAMP,
+	CURRENT_VIB_MAG,
+	CURRENT_TEMP,
+	CURRENT_AMPS_VAL,
+	CURRENT_RPM,
+	CURRENT_ACOUSTIC,
+	VIB_MAG_MEAN_6H,
+	VIB_MAG_STD_6H,
+	VIB_MAG_MIN_6H,
+	VIB_MAG_MAX_6H,
+	VIB_CREST_FACTOR_6H,
+	VIB_PEAK_TO_PEAK_6H,
+	VIB_RMS_6H,
+	VIB_COEFF_VAR_6H,
+	TEMP_MEAN_6H,
+	TEMP_STD_6H,
+	TEMP_MAX_6H,
+	CURRENT_MEAN_6H,
+	CURRENT_STD_6H,
+	CURRENT_MAX_6H,
+	VIB_MAG_MEAN_24H,
+	VIB_MAG_STD_24H,
+	VIB_MAG_MIN_24H,
+	VIB_MAG_MAX_24H,
+	VIB_CREST_FACTOR_24H,
+	VIB_PEAK_TO_PEAK_24H,
+	VIB_RMS_24H,
+	VIB_COEFF_VAR_24H,
+	TEMP_MEAN_24H,
+	TEMP_STD_24H,
+	TEMP_MAX_24H,
+	CURRENT_MEAN_24H,
+	CURRENT_STD_24H,
+	CURRENT_MAX_24H,
+	ACOUSTIC_MEAN_24H,
+	ACOUSTIC_STD_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	TEMP_RATE_OF_CHANGE_1H,
+	CURRENT_RATE_OF_CHANGE_1H
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH base AS (
+    SELECT 
+        asset_id,
+        timestamp,
+        SQRT(POWER(vibration_x,2)+POWER(vibration_y,2)+POWER(vibration_z,2)) AS vib_mag,
+        vibration_x, vibration_y, vibration_z,
+        temperature,
+        rpm,
+        current_amps,
+        acoustic_db,
+        ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp) AS rn
+    FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS
+)
+SELECT 
+    asset_id,
+    timestamp,
+    vib_mag AS current_vib_mag,
+    temperature AS current_temp,
+    current_amps AS current_amps_val,
+    rpm AS current_rpm,
+    acoustic_db AS current_acoustic,
+    
+    -- 6HR WINDOW (24 rows at 15-min intervals): VIBRATION
+    AVG(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) AS vib_mag_mean_6h,
+    STDDEV(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) AS vib_mag_std_6h,
+    MIN(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) AS vib_mag_min_6h,
+    MAX(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) AS vib_mag_max_6h,
+    -- Crest Factor = Peak / RMS
+    MAX(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) /
+        NULLIF(SQRT(AVG(POWER(vib_mag,2)) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW)),0) AS vib_crest_factor_6h,
+    -- Peak-to-Peak
+    MAX(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) -
+        MIN(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) AS vib_peak_to_peak_6h,
+    -- RMS Energy
+    SQRT(AVG(POWER(vib_mag,2)) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW)) AS vib_rms_6h,
+    -- Coefficient of Variation
+    STDDEV(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) /
+        NULLIF(AVG(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW),0) AS vib_coeff_var_6h,
+    
+    -- 6HR: TEMPERATURE
+    AVG(temperature) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) AS temp_mean_6h,
+    STDDEV(temperature) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) AS temp_std_6h,
+    MAX(temperature) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) AS temp_max_6h,
+    
+    -- 6HR: CURRENT
+    AVG(current_amps) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) AS current_mean_6h,
+    STDDEV(current_amps) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) AS current_std_6h,
+    MAX(current_amps) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) AS current_max_6h,
+
+    -- 24HR WINDOW (96 rows): VIBRATION
+    AVG(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS vib_mag_mean_24h,
+    STDDEV(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS vib_mag_std_24h,
+    MIN(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS vib_mag_min_24h,
+    MAX(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS vib_mag_max_24h,
+    MAX(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) /
+        NULLIF(SQRT(AVG(POWER(vib_mag,2)) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW)),0) AS vib_crest_factor_24h,
+    MAX(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) -
+        MIN(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS vib_peak_to_peak_24h,
+    SQRT(AVG(POWER(vib_mag,2)) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW)) AS vib_rms_24h,
+    STDDEV(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) /
+        NULLIF(AVG(vib_mag) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW),0) AS vib_coeff_var_24h,
+
+    -- 24HR: TEMPERATURE
+    AVG(temperature) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS temp_mean_24h,
+    STDDEV(temperature) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS temp_std_24h,
+    MAX(temperature) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS temp_max_24h,
+
+    -- 24HR: CURRENT
+    AVG(current_amps) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS current_mean_24h,
+    STDDEV(current_amps) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS current_std_24h,
+    MAX(current_amps) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS current_max_24h,
+
+    -- 24HR: ACOUSTIC
+    AVG(acoustic_db) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS acoustic_mean_24h,
+    STDDEV(acoustic_db) OVER (PARTITION BY asset_id ORDER BY rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS acoustic_std_24h,
+
+    -- DYNAMICS: Rate of change (1hr = 4 readings apart)
+    (vib_mag - LAG(vib_mag, 4) OVER (PARTITION BY asset_id ORDER BY rn)) AS vib_rate_of_change_1h,
+    -- Acceleration of change (2nd derivative)
+    (vib_mag - 2*LAG(vib_mag, 4) OVER (PARTITION BY asset_id ORDER BY rn) + LAG(vib_mag, 8) OVER (PARTITION BY asset_id ORDER BY rn)) AS vib_acceleration_1h,
+    -- Temperature rate of change
+    (temperature - LAG(temperature, 4) OVER (PARTITION BY asset_id ORDER BY rn)) AS temp_rate_of_change_1h,
+    -- Current rate of change  
+    (current_amps - LAG(current_amps, 4) OVER (PARTITION BY asset_id ORDER BY rn)) AS current_rate_of_change_1h
+
+FROM base;
+create or replace dynamic table SENSOR_INTERACTIONS(
+	ASSET_ID,
+	TIMESTAMP,
+	VIB_XY_CORRELATION_DAILY,
+	VIB_TEMP_COUPLING_DAILY,
+	CURRENT_RPM_RATIO,
+	TEMP_LOAD_RATIO,
+	VIB_AXIS_DOMINANCE,
+	ACOUSTIC_VIB_RATIO,
+	CURRENT_VIB_COUPLING_DAILY
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH daily_corr AS (
+    SELECT 
+        asset_id,
+        DATE_TRUNC('day', timestamp) AS reading_date,
+        -- Correlations computed daily (96 readings per day)
+        CORR(vibration_x, vibration_y) AS vib_xy_correlation,
+        CORR(SQRT(POWER(vibration_x,2)+POWER(vibration_y,2)+POWER(vibration_z,2)), temperature) AS vib_temp_coupling,
+        CORR(current_amps, SQRT(POWER(vibration_x,2)+POWER(vibration_y,2)+POWER(vibration_z,2))) AS current_vib_coupling
+    FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS
+    GROUP BY asset_id, DATE_TRUNC('day', timestamp)
+),
+readings AS (
+    SELECT 
+        asset_id,
+        timestamp,
+        DATE_TRUNC('day', timestamp) AS reading_date,
+        vibration_x, vibration_y, vibration_z,
+        SQRT(POWER(vibration_x,2)+POWER(vibration_y,2)+POWER(vibration_z,2)) AS vib_mag,
+        temperature,
+        rpm,
+        current_amps,
+        acoustic_db
+    FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS
+)
+SELECT 
+    r.asset_id,
+    r.timestamp,
+    
+    -- 1. Vib_X to Vib_Y correlation (daily) — high = misalignment, low = bearing
+    dc.vib_xy_correlation AS vib_xy_correlation_daily,
+    
+    -- 2. Vibration to Temperature coupling — friction source detector
+    dc.vib_temp_coupling AS vib_temp_coupling_daily,
+    
+    -- 3. Current to RPM ratio — load-normalized power (rising = mechanical resistance)
+    r.current_amps / NULLIF(r.rpm, 0) * 1000 AS current_rpm_ratio,
+    
+    -- 4. Temperature to Load ratio — heat per unit work (rising = efficiency loss)
+    r.temperature / NULLIF(r.current_amps * r.rpm, 0) * 10000 AS temp_load_ratio,
+    
+    -- 5. Vibration axis dominance — X-dominant = imbalance, multi-axis = misalignment
+    GREATEST(ABS(r.vibration_x), ABS(r.vibration_y), ABS(r.vibration_z)) / NULLIF(r.vib_mag, 0) AS vib_axis_dominance,
+    
+    -- 6. Acoustic to Vibration ratio — rising with stable vib = internal crack
+    r.acoustic_db / NULLIF(r.vib_mag, 0) AS acoustic_vib_ratio,
+    
+    -- 7. Current-Vibration coupling (daily) — mechanical load transfer
+    dc.current_vib_coupling AS current_vib_coupling_daily
+
+FROM readings r
+JOIN daily_corr dc ON r.asset_id = dc.asset_id AND r.reading_date = dc.reading_date;
+create or replace dynamic table TEMPORAL_MEMORY(
+	ASSET_ID,
+	TIMESTAMP,
+	HOURS_SINCE_FIRST_BREACH,
+	DEGRADATION_VELOCITY_30D,
+	TREND_REVERSAL_COUNT_7D,
+	ABOVE_NORMAL_COUNT_24H,
+	VIB_TREND_72H,
+	DEGRADATION_ACCELERATION
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH base AS (
+    SELECT 
+        asset_id,
+        timestamp,
+        SQRT(POWER(vibration_x,2)+POWER(vibration_y,2)+POWER(vibration_z,2)) AS vib_mag,
+        ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp) AS rn
+    FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS
+),
+-- First time each asset crossed threshold of 3.5 mm/s
+first_breach AS (
+    SELECT asset_id, MIN(timestamp) AS first_breach_ts
+    FROM base
+    WHERE vib_mag > 3.5
+    GROUP BY asset_id
+),
+-- 30-day-ago value for degradation velocity
+lagged AS (
+    SELECT 
+        asset_id,
+        timestamp,
+        vib_mag,
+        rn,
+        LAG(vib_mag, 2880) OVER (PARTITION BY asset_id ORDER BY rn) AS vib_30d_ago,  -- 30 days * 96/day
+        -- Detect trend reversals: did vib decrease then increase?
+        CASE 
+            WHEN vib_mag > LAG(vib_mag, 1) OVER (PARTITION BY asset_id ORDER BY rn)
+             AND LAG(vib_mag, 1) OVER (PARTITION BY asset_id ORDER BY rn) < LAG(vib_mag, 2) OVER (PARTITION BY asset_id ORDER BY rn)
+            THEN 1 ELSE 0
+        END AS is_reversal,
+        -- Above normal flag (mean + 2*std approximation — using 3.0 as threshold)
+        CASE WHEN vib_mag > 3.0 THEN 1 ELSE 0 END AS above_normal
+    FROM base
+),
+-- Count reversals in 7-day window and longest above-normal streak
+features AS (
+    SELECT 
+        l.asset_id,
+        l.timestamp,
+        l.vib_mag,
+        
+        -- 1. Hours since first threshold breach
+        DATEDIFF('hour', fb.first_breach_ts, l.timestamp) AS hours_since_first_breach,
+        
+        -- 2. Degradation velocity (mm/s per day over 30 days)
+        (l.vib_mag - l.vib_30d_ago) / 30.0 AS degradation_velocity_30d,
+        
+        -- 3. Trend reversal count (7 days = 672 readings)
+        SUM(l.is_reversal) OVER (PARTITION BY l.asset_id ORDER BY l.rn ROWS BETWEEN 672 PRECEDING AND CURRENT ROW) AS trend_reversal_count_7d,
+        
+        -- 4. Longest continuous above-normal streak (running)
+        SUM(l.above_normal) OVER (PARTITION BY l.asset_id ORDER BY l.rn ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS above_normal_count_24h,
+        
+        -- 5. Time in high-load regime (% of last 24h where rpm > 95% rated)
+        -- Will be computed via join with asset master below
+        l.rn,
+        
+        -- 6. Vibration trend direction (slope approximation: current vs 72h ago)
+        (l.vib_mag - LAG(l.vib_mag, 288) OVER (PARTITION BY l.asset_id ORDER BY l.rn)) AS vib_trend_72h
+        
+    FROM lagged l
+    LEFT JOIN first_breach fb ON l.asset_id = fb.asset_id
+)
+SELECT 
+    f.asset_id,
+    f.timestamp,
+    -- 1. Hours since first threshold breach (NULL if never breached = healthy)
+    f.hours_since_first_breach,
+    -- 2. Degradation velocity (mm/s per day) — 2.0 mm/s/day = fast degradation
+    f.degradation_velocity_30d,
+    -- 3. Trend reversals in 7 days — monotonic = true degradation, oscillating = intermittent
+    f.trend_reversal_count_7d,
+    -- 4. Above-normal readings in last 24h (out of 96) — sustained = structural change
+    f.above_normal_count_24h,
+    -- 5. 72-hour vibration trend (positive = worsening)
+    f.vib_trend_72h,
+    -- 6. Degradation acceleration (is velocity increasing?)
+    f.degradation_velocity_30d - LAG(f.degradation_velocity_30d, 96) OVER (PARTITION BY f.asset_id ORDER BY f.rn) AS degradation_acceleration
+FROM features f;
+create or replace view ALL_DERIVED_FEATURES(
+	ASSET_ID,
+	TIMESTAMP,
+	VIB_CREST_FACTOR_6H,
+	VIB_COEFF_VAR_6H,
+	VIB_PEAK_TO_PEAK_6H,
+	VIB_MAG_STD_6H,
+	VIB_CREST_FACTOR_24H,
+	VIB_COEFF_VAR_24H,
+	VIB_PEAK_TO_PEAK_24H,
+	VIB_MAG_STD_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	TEMP_RATE_OF_CHANGE_1H,
+	VIB_XY_CORRELATION_DAILY,
+	CURRENT_RPM_RATIO,
+	ACOUSTIC_VIB_RATIO,
+	ENERGY_BALANCE_RATIO,
+	STRESS_INDEX
+) as
+SELECT 
+    rs.asset_id,
+    rs.timestamp,
+    rs.vib_crest_factor_6h,
+    rs.vib_coeff_var_6h,
+    rs.vib_peak_to_peak_6h,
+    rs.vib_mag_std_6h,
+    rs.vib_crest_factor_24h,
+    rs.vib_coeff_var_24h,
+    rs.vib_peak_to_peak_24h,
+    rs.vib_mag_std_24h,
+    rs.vib_rate_of_change_1h,
+    rs.vib_acceleration_1h,
+    rs.temp_rate_of_change_1h,
+    si.vib_xy_correlation_daily,
+    si.current_rpm_ratio,
+    si.acoustic_vib_ratio,
+    pc.energy_balance_ratio,
+    pc.stress_index
+FROM MFGPULSE_DB.ML_FEATURES.ROLLING_STATS rs
+JOIN MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS si 
+    ON rs.asset_id = si.asset_id AND rs.timestamp = si.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE pc 
+    ON rs.asset_id = pc.asset_id AND rs.timestamp = pc.timestamp;
+create or replace view ALL_DERIVED_FEATURES_INFERENCE(
+	ASSET_ID,
+	TIMESTAMP,
+	VIB_CREST_FACTOR_6H,
+	VIB_COEFF_VAR_6H,
+	VIB_PEAK_TO_PEAK_6H,
+	VIB_MAG_STD_6H,
+	VIB_CREST_FACTOR_24H,
+	VIB_COEFF_VAR_24H,
+	VIB_PEAK_TO_PEAK_24H,
+	VIB_MAG_STD_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	TEMP_RATE_OF_CHANGE_1H,
+	VIB_XY_CORRELATION_DAILY,
+	CURRENT_RPM_RATIO,
+	ACOUSTIC_VIB_RATIO,
+	ENERGY_BALANCE_RATIO,
+	STRESS_INDEX
+) as
+SELECT * FROM MFGPULSE_DB.ML_FEATURES.ALL_DERIVED_FEATURES
+WHERE TIMESTAMP >= '2024-05-01';
+create or replace view FEATURE_CATALOG(
+	FEATURE_NAME,
+	LAYER,
+	FORMULA_DESCRIPTION,
+	PHYSICS_RATIONALE,
+	USED_BY_MODELS
+) as
+SELECT column1 AS feature_name, column2 AS layer, column3 AS formula_description, column4 AS physics_rationale, column5 AS used_by_models
+FROM VALUES
+('vib_mag_mean_6h','Rolling Stats','AVG(vib_magnitude) over 6hr window','Baseline vibration level','M1,M3'),
+('vib_mag_std_6h','Rolling Stats','STDDEV(vib_magnitude) over 6hr','Signal instability indicator','M1'),
+('vib_mag_max_6h','Rolling Stats','MAX(vib_magnitude) over 6hr','Peak detection for impulsive events','M1'),
+('vib_crest_factor_6h','Rolling Stats','Peak/RMS over 6hr','Bearing damage creates sharp peaks in normal RMS signal','M1,M3,M4'),
+('vib_peak_to_peak_6h','Rolling Stats','MAX-MIN over 6hr','Vibration amplitude range','M1'),
+('vib_rms_6h','Rolling Stats','RMS energy over 6hr','ISO 10816 vibration severity standard','M1,M2'),
+('vib_coeff_var_6h','Rolling Stats','StdDev/Mean over 6hr','Signal stability - high CoV = intermittent contact','M1,M4'),
+('vib_rate_of_change_1h','Rolling Stats','Current - 1hr_ago','1st derivative: degradation speed','M1,M2,M3'),
+('vib_acceleration_1h','Rolling Stats','2nd derivative of vibration','When degradation is accelerating','M2,M4'),
+('vib_xy_correlation_daily','Sensor Interactions','CORR(vib_x, vib_y) daily','High=misalignment, Low=bearing defect','M1,M3'),
+('vib_temp_coupling_daily','Sensor Interactions','CORR(vib_mag, temperature)','Both rising=friction source','M1'),
+('current_rpm_ratio','Sensor Interactions','current_amps/rpm*1000','Load-normalized power draw','M1,M3'),
+('vib_axis_dominance','Sensor Interactions','MAX(axis)/magnitude','X-dominant=imbalance, Multi-axis=misalignment','M1,M3'),
+('acoustic_vib_ratio','Sensor Interactions','acoustic_db/vib_mag','Rising with stable vib = internal crack','M1,M4'),
+('hours_since_first_breach','Temporal Memory','Time since vib>3.5mm/s','P-F interval position','M2,M3'),
+('degradation_velocity_30d','Temporal Memory','(current-30d_ago)/30','Speed of deterioration','M2,M3,M6'),
+('trend_reversal_count_7d','Temporal Memory','Direction changes in 7d','Monotonic=true degradation, Oscillating=intermittent','M3'),
+('above_normal_count_24h','Temporal Memory','Readings > mean+2σ in 24h','Sustained deviation = structural change','M3'),
+('days_since_last_maintenance','Cross Domain','DATEDIFF from last WO','Time since human intervention','M2'),
+('cumulative_operating_hours','Cross Domain','Hours since install_date','Equipment odometer','M2'),
+('maintenance_effectiveness','Cross Domain','vib_after/vib_before repair','<1=effective, >1=wrong root cause','M2'),
+('stress_index','Physics','Weighted multi-signal stress','Combined operating stress level','M1,M2,M3,M4'),
+('composite_health_score','Physics','100 - penalty(vib,temp,current,acoustic)','Overall health 0-100','M1,M3'),
+('iso_10816_severity','Physics','ISO standard vibration zones','Industry standard severity classification','M1,M3'),
+('energy_balance_ratio','Physics','(pressure*rpm)/(current*100)','Energy efficiency - divergence=friction loss','M4'),
+('fatigue_score','Hidden Fatigue','6-component physics-based UDF','Hidden degradation before threshold alerts','M4,M5,M6,M7'),
+('vib_zscore_vs_fleet','Fleet Comparison','(asset-fleet_avg)/fleet_std','Performance vs peer assets of same type','Dashboard'),
+('is_worst_in_fleet','Fleet Comparison','MAX(vib) = fleet max?','Worst performer identification','Dashboard');
+create or replace view HEALTHY_DERIVED_FEATURES(
+	ASSET_ID,
+	TIMESTAMP,
+	VIB_CREST_FACTOR_6H,
+	VIB_COEFF_VAR_6H,
+	VIB_PEAK_TO_PEAK_6H,
+	VIB_MAG_STD_6H,
+	VIB_CREST_FACTOR_24H,
+	VIB_COEFF_VAR_24H,
+	VIB_PEAK_TO_PEAK_24H,
+	VIB_MAG_STD_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	TEMP_RATE_OF_CHANGE_1H,
+	VIB_XY_CORRELATION_DAILY,
+	CURRENT_RPM_RATIO,
+	ACOUSTIC_VIB_RATIO,
+	ENERGY_BALANCE_RATIO,
+	STRESS_INDEX
+) as
+SELECT 
+    rs.asset_id,
+    rs.timestamp,
+    -- DERIVED features only (not raw signals)
+    rs.vib_crest_factor_6h,
+    rs.vib_coeff_var_6h,
+    rs.vib_peak_to_peak_6h,
+    rs.vib_mag_std_6h,
+    rs.vib_crest_factor_24h,
+    rs.vib_coeff_var_24h,
+    rs.vib_peak_to_peak_24h,
+    rs.vib_mag_std_24h,
+    rs.vib_rate_of_change_1h,
+    rs.vib_acceleration_1h,
+    rs.temp_rate_of_change_1h,
+    si.vib_xy_correlation_daily,
+    si.current_rpm_ratio,
+    si.acoustic_vib_ratio,
+    pc.energy_balance_ratio,
+    pc.stress_index
+FROM MFGPULSE_DB.ML_FEATURES.ROLLING_STATS rs
+JOIN MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS si 
+    ON rs.asset_id = si.asset_id AND rs.timestamp = si.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE pc 
+    ON rs.asset_id = pc.asset_id AND rs.timestamp = pc.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.LABELED_DATA ld
+    ON rs.asset_id = ld.asset_id AND rs.timestamp = ld.timestamp
+WHERE ld.failure_mode = 'normal' 
+   OR (ld.degradation_stage = 0 AND ld.hours_to_failure > 720);
+create or replace view HEALTHY_DERIVED_FEATURES_TRAIN(
+	ASSET_ID,
+	TIMESTAMP,
+	VIB_CREST_FACTOR_6H,
+	VIB_COEFF_VAR_6H,
+	VIB_PEAK_TO_PEAK_6H,
+	VIB_MAG_STD_6H,
+	VIB_CREST_FACTOR_24H,
+	VIB_COEFF_VAR_24H,
+	VIB_PEAK_TO_PEAK_24H,
+	VIB_MAG_STD_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	TEMP_RATE_OF_CHANGE_1H,
+	VIB_XY_CORRELATION_DAILY,
+	CURRENT_RPM_RATIO,
+	ACOUSTIC_VIB_RATIO,
+	ENERGY_BALANCE_RATIO,
+	STRESS_INDEX
+) as
+SELECT * FROM MFGPULSE_DB.ML_FEATURES.HEALTHY_DERIVED_FEATURES
+WHERE TIMESTAMP < '2024-05-01';
+create or replace view TRAIN_ANOMALY(
+	ASSET_ID,
+	TIMESTAMP,
+	VIB_MAG_MEAN_6H,
+	VIB_MAG_STD_6H,
+	VIB_CREST_FACTOR_6H,
+	VIB_RMS_6H,
+	VIB_COEFF_VAR_6H,
+	TEMP_MEAN_6H,
+	TEMP_STD_6H,
+	CURRENT_MEAN_6H,
+	CURRENT_STD_6H,
+	VIB_MAG_MEAN_24H,
+	VIB_MAG_STD_24H,
+	VIB_CREST_FACTOR_24H,
+	VIB_XY_CORRELATION_DAILY,
+	CURRENT_RPM_RATIO,
+	VIB_AXIS_DOMINANCE,
+	ACOUSTIC_VIB_RATIO,
+	STRESS_INDEX,
+	ENERGY_BALANCE_RATIO,
+	THERMAL_EFFICIENCY
+) as
+-- ONLY healthy asset data for anomaly detection (train on normal, detect deviations)
+SELECT 
+    ld.asset_id, ld.timestamp,
+    rs.vib_mag_mean_6h, rs.vib_mag_std_6h, rs.vib_crest_factor_6h, rs.vib_rms_6h, rs.vib_coeff_var_6h,
+    rs.temp_mean_6h, rs.temp_std_6h, rs.current_mean_6h, rs.current_std_6h,
+    rs.vib_mag_mean_24h, rs.vib_mag_std_24h, rs.vib_crest_factor_24h,
+    si.vib_xy_correlation_daily, si.current_rpm_ratio, si.vib_axis_dominance, si.acoustic_vib_ratio,
+    pc.stress_index, pc.energy_balance_ratio, pc.thermal_efficiency
+FROM MFGPULSE_DB.ML_FEATURES.LABELED_DATA ld
+JOIN MFGPULSE_DB.ML_FEATURES.ROLLING_STATS rs ON ld.asset_id = rs.asset_id AND ld.timestamp = rs.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS si ON ld.asset_id = si.asset_id AND ld.timestamp = si.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE pc ON ld.asset_id = pc.asset_id AND ld.timestamp = pc.timestamp
+WHERE ld.failure_mode = 'normal' 
+   OR (ld.degradation_stage = 0 AND ld.hours_to_failure > 720);
+create or replace view TRAIN_ANOMALY_SMALL(
+	ASSET_ID,
+	TIMESTAMP,
+	VIB_MAG_MEAN_6H,
+	VIB_MAG_STD_6H,
+	VIB_CREST_FACTOR_6H,
+	VIB_RMS_6H,
+	VIB_COEFF_VAR_6H,
+	TEMP_MEAN_6H,
+	TEMP_STD_6H,
+	CURRENT_MEAN_6H,
+	CURRENT_STD_6H,
+	VIB_MAG_MEAN_24H,
+	VIB_MAG_STD_24H,
+	VIB_CREST_FACTOR_24H,
+	VIB_XY_CORRELATION_DAILY,
+	CURRENT_RPM_RATIO,
+	VIB_AXIS_DOMINANCE,
+	ACOUSTIC_VIB_RATIO,
+	STRESS_INDEX,
+	ENERGY_BALANCE_RATIO,
+	THERMAL_EFFICIENCY
+) as
+SELECT * FROM MFGPULSE_DB.ML_FEATURES.TRAIN_ANOMALY
+WHERE ASSET_ID IN ('ASSET_007', 'ASSET_010')
+AND TIMESTAMP >= '2024-03-01';
+create or replace view TRAIN_FAILURE_MODE(
+	ASSET_ID,
+	TIMESTAMP,
+	FAILURE_MODE,
+	DEGRADATION_STAGE,
+	VIB_MAG_MEAN_6H,
+	VIB_MAG_STD_6H,
+	VIB_MAG_MAX_6H,
+	VIB_CREST_FACTOR_6H,
+	VIB_PEAK_TO_PEAK_6H,
+	VIB_RMS_6H,
+	VIB_COEFF_VAR_6H,
+	TEMP_MEAN_6H,
+	TEMP_STD_6H,
+	CURRENT_MEAN_6H,
+	CURRENT_STD_6H,
+	VIB_MAG_MEAN_24H,
+	VIB_MAG_STD_24H,
+	VIB_CREST_FACTOR_24H,
+	VIB_RMS_24H,
+	TEMP_MEAN_24H,
+	CURRENT_MEAN_24H,
+	ACOUSTIC_MEAN_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	VIB_XY_CORRELATION_DAILY,
+	VIB_TEMP_COUPLING_DAILY,
+	CURRENT_RPM_RATIO,
+	VIB_AXIS_DOMINANCE,
+	ACOUSTIC_VIB_RATIO,
+	STRESS_INDEX,
+	ISO_10816_SEVERITY,
+	COMPOSITE_HEALTH_SCORE
+) as
+-- Balanced dataset for multi-class failure mode prediction
+SELECT 
+    ld.asset_id, ld.timestamp, ld.failure_mode, ld.degradation_stage,
+    rs.vib_mag_mean_6h, rs.vib_mag_std_6h, rs.vib_mag_max_6h, rs.vib_crest_factor_6h,
+    rs.vib_peak_to_peak_6h, rs.vib_rms_6h, rs.vib_coeff_var_6h,
+    rs.temp_mean_6h, rs.temp_std_6h, rs.current_mean_6h, rs.current_std_6h,
+    rs.vib_mag_mean_24h, rs.vib_mag_std_24h, rs.vib_crest_factor_24h, rs.vib_rms_24h,
+    rs.temp_mean_24h, rs.current_mean_24h, rs.acoustic_mean_24h,
+    rs.vib_rate_of_change_1h, rs.vib_acceleration_1h,
+    si.vib_xy_correlation_daily, si.vib_temp_coupling_daily,
+    si.current_rpm_ratio, si.vib_axis_dominance, si.acoustic_vib_ratio,
+    pc.stress_index, pc.iso_10816_severity, pc.composite_health_score
+FROM MFGPULSE_DB.ML_FEATURES.LABELED_DATA ld
+JOIN MFGPULSE_DB.ML_FEATURES.ROLLING_STATS rs 
+    ON ld.asset_id = rs.asset_id AND ld.timestamp = rs.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS si 
+    ON ld.asset_id = si.asset_id AND ld.timestamp = si.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE pc 
+    ON ld.asset_id = pc.asset_id AND ld.timestamp = pc.timestamp
+WHERE ld.failure_mode != 'normal' 
+   OR (ld.failure_mode = 'normal' AND UNIFORM(0::FLOAT, 1::FLOAT, RANDOM()) < 0.50);
+create or replace view TRAIN_FM_SAMPLE(
+	ASSET_ID,
+	TIMESTAMP,
+	VIB_MAG_MEAN_6H,
+	VIB_MAG_STD_6H,
+	VIB_MAG_MAX_6H,
+	VIB_CREST_FACTOR_6H,
+	VIB_PEAK_TO_PEAK_6H,
+	VIB_RMS_6H,
+	VIB_COEFF_VAR_6H,
+	TEMP_MEAN_6H,
+	TEMP_STD_6H,
+	CURRENT_MEAN_6H,
+	CURRENT_STD_6H,
+	VIB_MAG_MEAN_24H,
+	VIB_MAG_STD_24H,
+	VIB_CREST_FACTOR_24H,
+	VIB_RMS_24H,
+	TEMP_MEAN_24H,
+	CURRENT_MEAN_24H,
+	ACOUSTIC_MEAN_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	VIB_XY_CORRELATION_DAILY,
+	VIB_TEMP_COUPLING_DAILY,
+	CURRENT_RPM_RATIO,
+	VIB_AXIS_DOMINANCE,
+	ACOUSTIC_VIB_RATIO,
+	STRESS_INDEX,
+	ISO_10816_SEVERITY,
+	COMPOSITE_HEALTH_SCORE
+) as
+SELECT * EXCLUDE (FAILURE_MODE, DEGRADATION_STAGE)
+FROM MFGPULSE_DB.ML_FEATURES.TRAIN_FAILURE_MODE
+QUALIFY ROW_NUMBER() OVER (PARTITION BY ASSET_ID ORDER BY TIMESTAMP DESC) = 1;
+create or replace view TRAIN_RUL(
+	ASSET_ID,
+	TIMESTAMP,
+	HOURS_TO_FAILURE,
+	FAILURE_MODE,
+	DEGRADATION_STAGE,
+	VIB_MAG_MEAN_6H,
+	VIB_MAG_STD_6H,
+	VIB_MAG_MAX_6H,
+	VIB_CREST_FACTOR_6H,
+	VIB_RMS_6H,
+	VIB_COEFF_VAR_6H,
+	TEMP_MEAN_6H,
+	CURRENT_MEAN_6H,
+	VIB_MAG_MEAN_24H,
+	VIB_MAG_STD_24H,
+	VIB_CREST_FACTOR_24H,
+	VIB_RMS_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	TEMP_RATE_OF_CHANGE_1H,
+	VIB_XY_CORRELATION_DAILY,
+	VIB_TEMP_COUPLING_DAILY,
+	CURRENT_RPM_RATIO,
+	VIB_AXIS_DOMINANCE,
+	HOURS_SINCE_FIRST_BREACH,
+	DEGRADATION_VELOCITY_30D,
+	TREND_REVERSAL_COUNT_7D,
+	ABOVE_NORMAL_COUNT_24H,
+	VIB_TREND_72H,
+	DEGRADATION_ACCELERATION,
+	DAYS_SINCE_LAST_MAINTENANCE,
+	CUMULATIVE_OPERATING_HOURS,
+	MAINTENANCE_EFFECTIVENESS,
+	STRESS_INDEX,
+	COMPOSITE_HEALTH_SCORE,
+	THERMAL_EFFICIENCY
+) as
+-- Only degrading assets with known failure dates (hours_to_failure is not null)
+SELECT 
+    ld.asset_id, ld.timestamp, ld.hours_to_failure, ld.failure_mode, ld.degradation_stage,
+    rs.vib_mag_mean_6h, rs.vib_mag_std_6h, rs.vib_mag_max_6h, rs.vib_crest_factor_6h,
+    rs.vib_rms_6h, rs.vib_coeff_var_6h,
+    rs.temp_mean_6h, rs.current_mean_6h,
+    rs.vib_mag_mean_24h, rs.vib_mag_std_24h, rs.vib_crest_factor_24h, rs.vib_rms_24h,
+    rs.vib_rate_of_change_1h, rs.vib_acceleration_1h, rs.temp_rate_of_change_1h,
+    si.vib_xy_correlation_daily, si.vib_temp_coupling_daily, si.current_rpm_ratio, si.vib_axis_dominance,
+    tm.hours_since_first_breach, tm.degradation_velocity_30d, tm.trend_reversal_count_7d,
+    tm.above_normal_count_24h, tm.vib_trend_72h, tm.degradation_acceleration,
+    cd.days_since_last_maintenance, cd.cumulative_operating_hours, cd.maintenance_effectiveness,
+    pc.stress_index, pc.composite_health_score, pc.thermal_efficiency
+FROM MFGPULSE_DB.ML_FEATURES.LABELED_DATA ld
+JOIN MFGPULSE_DB.ML_FEATURES.ROLLING_STATS rs ON ld.asset_id = rs.asset_id AND ld.timestamp = rs.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS si ON ld.asset_id = si.asset_id AND ld.timestamp = si.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.TEMPORAL_MEMORY tm ON ld.asset_id = tm.asset_id AND ld.timestamp = tm.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.CROSS_DOMAIN cd ON ld.asset_id = cd.asset_id AND ld.timestamp = cd.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE pc ON ld.asset_id = pc.asset_id AND ld.timestamp = pc.timestamp
+WHERE ld.hours_to_failure IS NOT NULL AND ld.is_degrading = 1;
+create or replace view TRAIN_TRAJECTORY(
+	ASSET_ID,
+	TIMESTAMP,
+	DEGRADATION_STAGE,
+	FAILURE_MODE,
+	VIB_MAG_MEAN_6H,
+	VIB_MAG_STD_6H,
+	VIB_MAG_MAX_6H,
+	VIB_CREST_FACTOR_6H,
+	VIB_RMS_6H,
+	VIB_PEAK_TO_PEAK_6H,
+	TEMP_MEAN_6H,
+	CURRENT_MEAN_6H,
+	VIB_MAG_MEAN_24H,
+	VIB_RMS_24H,
+	VIB_COEFF_VAR_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	VIB_XY_CORRELATION_DAILY,
+	CURRENT_RPM_RATIO,
+	VIB_AXIS_DOMINANCE,
+	HOURS_SINCE_FIRST_BREACH,
+	DEGRADATION_VELOCITY_30D,
+	ABOVE_NORMAL_COUNT_24H,
+	VIB_TREND_72H,
+	DAYS_SINCE_LAST_MAINTENANCE,
+	CUMULATIVE_OPERATING_HOURS,
+	STRESS_INDEX,
+	COMPOSITE_HEALTH_SCORE,
+	ISO_10816_SEVERITY
+) as
+-- All stages, with oversampling for rare critical stages (stage 3 & 4)
+SELECT 
+    ld.asset_id, ld.timestamp, ld.degradation_stage, ld.failure_mode,
+    rs.vib_mag_mean_6h, rs.vib_mag_std_6h, rs.vib_mag_max_6h, rs.vib_crest_factor_6h,
+    rs.vib_rms_6h, rs.vib_peak_to_peak_6h,
+    rs.temp_mean_6h, rs.current_mean_6h,
+    rs.vib_mag_mean_24h, rs.vib_rms_24h, rs.vib_coeff_var_24h,
+    rs.vib_rate_of_change_1h, rs.vib_acceleration_1h,
+    si.vib_xy_correlation_daily, si.current_rpm_ratio, si.vib_axis_dominance,
+    tm.hours_since_first_breach, tm.degradation_velocity_30d, tm.above_normal_count_24h, tm.vib_trend_72h,
+    cd.days_since_last_maintenance, cd.cumulative_operating_hours,
+    pc.stress_index, pc.composite_health_score, pc.iso_10816_severity
+FROM MFGPULSE_DB.ML_FEATURES.LABELED_DATA ld
+JOIN MFGPULSE_DB.ML_FEATURES.ROLLING_STATS rs ON ld.asset_id = rs.asset_id AND ld.timestamp = rs.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS si ON ld.asset_id = si.asset_id AND ld.timestamp = si.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.TEMPORAL_MEMORY tm ON ld.asset_id = tm.asset_id AND ld.timestamp = tm.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.CROSS_DOMAIN cd ON ld.asset_id = cd.asset_id AND ld.timestamp = cd.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE pc ON ld.asset_id = pc.asset_id AND ld.timestamp = pc.timestamp
+WHERE ld.failure_mode != 'normal';
+create or replace view TRAIN_TRAJECTORY_3CLASS(
+	ASSET_ID,
+	TIMESTAMP,
+	FAILURE_MODE,
+	ORIGINAL_STAGE,
+	STAGE_3CLASS,
+	VIB_MAG_MEAN_6H,
+	VIB_MAG_STD_6H,
+	VIB_MAG_MAX_6H,
+	VIB_CREST_FACTOR_6H,
+	VIB_RMS_6H,
+	VIB_PEAK_TO_PEAK_6H,
+	TEMP_MEAN_6H,
+	CURRENT_MEAN_6H,
+	VIB_MAG_MEAN_24H,
+	VIB_RMS_24H,
+	VIB_COEFF_VAR_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	VIB_XY_CORRELATION_DAILY,
+	CURRENT_RPM_RATIO,
+	VIB_AXIS_DOMINANCE,
+	HOURS_SINCE_FIRST_BREACH,
+	DEGRADATION_VELOCITY_30D,
+	ABOVE_NORMAL_COUNT_24H,
+	VIB_TREND_72H,
+	DAYS_SINCE_LAST_MAINTENANCE,
+	CUMULATIVE_OPERATING_HOURS,
+	STRESS_INDEX,
+	COMPOSITE_HEALTH_SCORE,
+	ISO_10816_SEVERITY
+) as
+SELECT 
+    ld.asset_id, ld.timestamp, ld.failure_mode,
+    ld.degradation_stage AS original_stage,
+    CASE 
+        WHEN ld.degradation_stage IN (0, 1) THEN 'Healthy'
+        WHEN ld.degradation_stage = 2 THEN 'Warning'
+        WHEN ld.degradation_stage IN (3, 4) THEN 'Critical'
+    END AS stage_3class,
+    rs.vib_mag_mean_6h, rs.vib_mag_std_6h, rs.vib_mag_max_6h, rs.vib_crest_factor_6h,
+    rs.vib_rms_6h, rs.vib_peak_to_peak_6h,
+    rs.temp_mean_6h, rs.current_mean_6h,
+    rs.vib_mag_mean_24h, rs.vib_rms_24h, rs.vib_coeff_var_24h,
+    rs.vib_rate_of_change_1h, rs.vib_acceleration_1h,
+    si.vib_xy_correlation_daily, si.current_rpm_ratio, si.vib_axis_dominance,
+    tm.hours_since_first_breach, tm.degradation_velocity_30d, tm.above_normal_count_24h, tm.vib_trend_72h,
+    cd.days_since_last_maintenance, cd.cumulative_operating_hours,
+    pc.stress_index, pc.composite_health_score, pc.iso_10816_severity
+FROM MFGPULSE_DB.ML_FEATURES.LABELED_DATA ld
+JOIN MFGPULSE_DB.ML_FEATURES.ROLLING_STATS rs ON ld.asset_id = rs.asset_id AND ld.timestamp = rs.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS si ON ld.asset_id = si.asset_id AND ld.timestamp = si.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.TEMPORAL_MEMORY tm ON ld.asset_id = tm.asset_id AND ld.timestamp = tm.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.CROSS_DOMAIN cd ON ld.asset_id = cd.asset_id AND ld.timestamp = cd.timestamp
+JOIN MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE pc ON ld.asset_id = pc.asset_id AND ld.timestamp = pc.timestamp
+WHERE ld.failure_mode != 'normal';
+create or replace view TRAIN_TRAJ_SAMPLE(
+	ASSET_ID,
+	TIMESTAMP,
+	VIB_MAG_MEAN_6H,
+	VIB_MAG_STD_6H,
+	VIB_MAG_MAX_6H,
+	VIB_CREST_FACTOR_6H,
+	VIB_RMS_6H,
+	VIB_PEAK_TO_PEAK_6H,
+	TEMP_MEAN_6H,
+	CURRENT_MEAN_6H,
+	VIB_MAG_MEAN_24H,
+	VIB_RMS_24H,
+	VIB_COEFF_VAR_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	VIB_XY_CORRELATION_DAILY,
+	CURRENT_RPM_RATIO,
+	VIB_AXIS_DOMINANCE,
+	HOURS_SINCE_FIRST_BREACH,
+	DEGRADATION_VELOCITY_30D,
+	ABOVE_NORMAL_COUNT_24H,
+	VIB_TREND_72H,
+	DAYS_SINCE_LAST_MAINTENANCE,
+	CUMULATIVE_OPERATING_HOURS,
+	STRESS_INDEX,
+	COMPOSITE_HEALTH_SCORE,
+	ISO_10816_SEVERITY
+) as
+SELECT * EXCLUDE (STAGE_3CLASS, ORIGINAL_STAGE, FAILURE_MODE)
+FROM MFGPULSE_DB.ML_FEATURES.TRAIN_TRAJECTORY_3CLASS
+QUALIFY ROW_NUMBER() OVER (PARTITION BY ASSET_ID ORDER BY TIMESTAMP DESC) = 1;
+create or replace schema ML_MODELS;
+
+create or replace TABLE ANOMALY_SCORES (
+	SERIES VARIANT,
+	TS TIMESTAMP_NTZ(9),
+	Y FLOAT,
+	FORECAST FLOAT,
+	LOWER_BOUND FLOAT,
+	UPPER_BOUND FLOAT,
+	IS_ANOMALY BOOLEAN,
+	PERCENTILE FLOAT,
+	DISTANCE FLOAT
+);
+create or replace TABLE DRIFT_COMPARISON (
+	COMPARISON_DATE DATE NOT NULL,
+	ASSET_ID VARCHAR(20) NOT NULL,
+	ASSET_NAME VARCHAR(100),
+	RULE_FAILURE_MODE VARCHAR(50),
+	NATIVE_FAILURE_MODE VARCHAR(50),
+	RULE_STAGE VARCHAR(50),
+	NATIVE_STAGE VARCHAR(50),
+	FAILURE_MODE_AGREES BOOLEAN,
+	STAGE_AGREES BOOLEAN,
+	RULE_DEGRADATION_SCORE FLOAT,
+	NATIVE_DEGRADATION_SCORE FLOAT,
+	COMPARED_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP()
+);
+create or replace TABLE FATIGUE_SCORES (
+	ASSET_ID VARCHAR(20),
+	TIMESTAMP TIMESTAMP_NTZ(9),
+	FATIGUE_SCORE FLOAT,
+	FATIGUE_LEVEL VARCHAR(20)
+);
+create or replace TABLE FEEDBACK_LOG (
+	FEEDBACK_ID NUMBER(38,0) autoincrement start 1 increment 1 noorder,
+	WO_ID VARCHAR(50) NOT NULL,
+	ASSET_ID VARCHAR(20) NOT NULL,
+	PREDICTED_FAILURE_MODE VARCHAR(20),
+	PREDICTED_STAGE VARCHAR(10),
+	CONFIRMED_ROOT_CAUSE VARCHAR(50),
+	WAS_CORRECT BOOLEAN,
+	STAGE_WAS_CORRECT BOOLEAN,
+	CONFIRMED_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+	CONFIRMED_BY VARCHAR(100)
+);
+create or replace dynamic table LIVE_PREDICTIONS(
+	ASSET_ID,
+	ASSET_NAME,
+	ASSET_TYPE,
+	LINE_ID,
+	PREDICTION_TIME,
+	FAILURE_MODE_PRED,
+	FAILURE_MODE_CONFIDENCE,
+	RUL_HOURS,
+	RUL_LOWER_CI,
+	RUL_UPPER_CI,
+	STAGE_PRED,
+	DEGRADATION_SCORE,
+	TRANSITION_PROBABILITY,
+	FATIGUE_SCORE,
+	FATIGUE_LEVEL,
+	COMPOSITE_HEALTH_SCORE,
+	STRESS_INDEX
+) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+ as
+WITH latest_rs AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn
+    FROM MFGPULSE_DB.ML_FEATURES.ROLLING_STATS
+),
+latest_si AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn
+    FROM MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS
+),
+latest_tm AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn
+    FROM MFGPULSE_DB.ML_FEATURES.TEMPORAL_MEMORY
+),
+latest_pc AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn
+    FROM MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE
+),
+latest_fs AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn
+    FROM MFGPULSE_DB.ML_MODELS.FATIGUE_SCORES
+),
+base AS (
+    SELECT 
+        am.asset_id, am.asset_name, am.asset_type, am.line_id,
+        rs.timestamp AS prediction_time,
+        rs.vib_rms_24h, rs.vib_crest_factor_6h, rs.vib_rate_of_change_1h, rs.vib_acceleration_1h,
+        rs.vib_mag_mean_24h, rs.vib_mag_std_24h, rs.acoustic_mean_24h,
+        rs.temp_mean_24h, rs.current_mean_24h,
+        COALESCE(si.vib_xy_correlation_daily, 0) AS xy_corr,
+        COALESCE(si.current_rpm_ratio, 0) AS crpm_ratio,
+        COALESCE(si.vib_axis_dominance, 0.5) AS axis_dom,
+        COALESCE(si.acoustic_vib_ratio, 0) AS av_ratio,
+        pc.stress_index, pc.composite_health_score, pc.iso_10816_severity,
+        tm.degradation_velocity_30d, tm.hours_since_first_breach, tm.above_normal_count_24h,
+        COALESCE(fs.fatigue_score, 0) AS fatigue_score,
+        COALESCE(fs.fatigue_level, 'HEALTHY') AS fatigue_level
+    FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER am
+    LEFT JOIN latest_rs rs ON am.asset_id = rs.asset_id AND rs.rn = 1
+    LEFT JOIN latest_si si ON am.asset_id = si.asset_id AND si.rn = 1
+    LEFT JOIN latest_tm tm ON am.asset_id = tm.asset_id AND tm.rn = 1
+    LEFT JOIN latest_pc pc ON am.asset_id = pc.asset_id AND pc.rn = 1
+    LEFT JOIN latest_fs fs ON am.asset_id = fs.asset_id AND fs.rn = 1
+),
+scored AS (
+    SELECT *,
+        -- Raw RUL calculation
+        ROUND(GREATEST(0,
+            CASE 
+                WHEN COALESCE(degradation_velocity_30d, 0) > 0.01 THEN
+                    (1.0 - fatigue_score) / (degradation_velocity_30d / 24.0)
+                WHEN stress_index > 0.7 THEN (1.0 - stress_index) * 500.0
+                ELSE 2000.0
+            END
+        ), 1) AS rul_hours,
+        -- Composite degradation score
+        ROUND(LEAST(1.0, GREATEST(0, (vib_rms_24h - 2.5)/10.0)) * 0.25 +
+              LEAST(1.0, GREATEST(0, (vib_crest_factor_6h - 1.2)/1.5)) * 0.15 +
+              LEAST(1.0, stress_index) * 0.15 +
+              LEAST(1.0, GREATEST(0, COALESCE(degradation_velocity_30d, 0)/0.5)) * 0.20 +
+              CASE WHEN hours_since_first_breach IS NULL THEN 0 ELSE LEAST(1.0, hours_since_first_breach/2000.0) END * 0.10 +
+              LEAST(1.0, COALESCE(above_normal_count_24h, 0)/80.0) * 0.15, 4) AS degradation_score
+    FROM base
+)
+SELECT 
+    asset_id, asset_name, asset_type, line_id, prediction_time,
+    
+    -- Failure Mode: catch-all for undetermined degradation (ISO 13379)
+    CASE
+        WHEN vib_crest_factor_6h > 1.5 AND av_ratio > 20 AND vib_rms_24h > 5.0 THEN 'bearing_wear'
+        WHEN temp_mean_24h > 70 AND vib_rms_24h < 4.0 AND stress_index > 0.5 THEN 'thermal_degradation'
+        WHEN ABS(xy_corr) > 0.6 AND crpm_ratio > 8.0 AND axis_dom < 0.7 THEN 'misalignment'
+        WHEN axis_dom > 0.75 AND vib_rms_24h > 4.0 AND crpm_ratio < 7.0 THEN 'imbalance'
+        WHEN degradation_score > 0.5 OR stress_index > 0.7 OR composite_health_score < 30 THEN 'undetermined_degradation'
+        ELSE 'normal'
+    END AS failure_mode_pred,
+    CASE WHEN composite_health_score < 30 THEN 0.95
+         WHEN composite_health_score < 60 THEN 0.80
+         WHEN composite_health_score < 80 THEN 0.65
+         ELSE 0.90 END AS failure_mode_confidence,
+
+    -- RUL
+    rul_hours,
+    ROUND(GREATEST(0,
+        CASE WHEN COALESCE(degradation_velocity_30d, 0) > 0.01 
+            THEN (1.0 - fatigue_score) / (degradation_velocity_30d * 1.5 / 24.0)
+            ELSE 1500.0 END
+    ), 1) AS rul_lower_ci,
+    ROUND(GREATEST(0,
+        CASE WHEN COALESCE(degradation_velocity_30d, 0) > 0.01 
+            THEN (1.0 - fatigue_score) / (degradation_velocity_30d * 0.5 / 24.0)
+            ELSE 3000.0 END
+    ), 1) AS rul_upper_ci,
+
+    -- Stage: RUL override per ISO 13381-1 / P-F curve
+    CASE 
+        WHEN rul_hours < 48 THEN 'Critical'
+        WHEN rul_hours < 168 AND degradation_score < 0.30 THEN 'Warning'
+        WHEN degradation_score >= 0.65 THEN 'Critical'
+        WHEN degradation_score >= 0.30 OR rul_hours < 168 THEN 'Warning'
+        ELSE 'Healthy'
+    END AS stage_pred,
+    degradation_score,
+    ROUND(LEAST(1.0, GREATEST(0, COALESCE(degradation_velocity_30d, 0)/0.5)) * 0.5 +
+          LEAST(1.0, COALESCE(above_normal_count_24h, 0)/80.0) * 0.5, 4) AS transition_probability,
+
+    -- Fatigue
+    fatigue_score,
+    fatigue_level,
+    
+    -- Health
+    composite_health_score,
+    stress_index
+FROM scored;
+create or replace TABLE MODEL_REGISTRY (
+	MODEL_NAME VARCHAR(100),
+	MODEL_TYPE VARCHAR(100),
+	TRAINING_DATA VARCHAR(200),
+	PRECISION_SCORE FLOAT,
+	RECALL_SCORE FLOAT,
+	F1_SCORE FLOAT,
+	TOP_FEATURES VARCHAR(500),
+	TRAINED_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP()
+);
+create or replace view _TEST_TRAIN(
+	FAILURE_MODE,
+	VIB_RMS_6H,
+	TEMP_MEAN_6H,
+	STRESS_INDEX,
+	COMPOSITE_HEALTH_SCORE
+) as
+SELECT FAILURE_MODE, VIB_RMS_6H, TEMP_MEAN_6H, STRESS_INDEX, COMPOSITE_HEALTH_SCORE
+FROM MFGPULSE_DB.ML_FEATURES.TRAIN_FAILURE_MODE
+SAMPLE (1000 ROWS);
+create or replace view _TMP_LATEST_FEATURES(
+	ASSET_ID,
+	VIB_MAG_MEAN_6H,
+	VIB_MAG_STD_6H,
+	VIB_MAG_MAX_6H,
+	VIB_CREST_FACTOR_6H,
+	VIB_PEAK_TO_PEAK_6H,
+	VIB_RMS_6H,
+	VIB_COEFF_VAR_6H,
+	TEMP_MEAN_6H,
+	TEMP_STD_6H,
+	CURRENT_MEAN_6H,
+	CURRENT_STD_6H,
+	VIB_MAG_MEAN_24H,
+	VIB_MAG_STD_24H,
+	VIB_CREST_FACTOR_24H,
+	VIB_RMS_24H,
+	TEMP_MEAN_24H,
+	CURRENT_MEAN_24H,
+	ACOUSTIC_MEAN_24H,
+	VIB_RATE_OF_CHANGE_1H,
+	VIB_ACCELERATION_1H,
+	VIB_XY_CORRELATION_DAILY,
+	VIB_TEMP_COUPLING_DAILY,
+	CURRENT_RPM_RATIO,
+	VIB_AXIS_DOMINANCE,
+	ACOUSTIC_VIB_RATIO,
+	STRESS_INDEX,
+	ISO_10816_SEVERITY,
+	COMPOSITE_HEALTH_SCORE
+) as
+WITH latest_rs AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn
+    FROM MFGPULSE_DB.ML_FEATURES.ROLLING_STATS QUALIFY rn = 1
+),
+latest_si AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn
+    FROM MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS QUALIFY rn = 1
+),
+latest_pc AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn
+    FROM MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE QUALIFY rn = 1
+)
+SELECT 
+    rs.asset_id,
+    rs.vib_mag_mean_6h, rs.vib_mag_std_6h, rs.vib_mag_max_6h, rs.vib_crest_factor_6h,
+    rs.vib_peak_to_peak_6h, rs.vib_rms_6h, rs.vib_coeff_var_6h,
+    rs.temp_mean_6h, rs.temp_std_6h, rs.current_mean_6h, rs.current_std_6h,
+    rs.vib_mag_mean_24h, rs.vib_mag_std_24h, rs.vib_crest_factor_24h, rs.vib_rms_24h,
+    rs.temp_mean_24h, rs.current_mean_24h, rs.acoustic_mean_24h,
+    rs.vib_rate_of_change_1h, rs.vib_acceleration_1h,
+    COALESCE(si.vib_xy_correlation_daily, 0) AS vib_xy_correlation_daily,
+    COALESCE(si.vib_temp_coupling_daily, 0) AS vib_temp_coupling_daily,
+    COALESCE(si.current_rpm_ratio, 0) AS current_rpm_ratio,
+    COALESCE(si.vib_axis_dominance, 0.5) AS vib_axis_dominance,
+    COALESCE(si.acoustic_vib_ratio, 0) AS acoustic_vib_ratio,
+    pc.stress_index, pc.iso_10816_severity, pc.composite_health_score
+FROM latest_rs rs
+LEFT JOIN latest_si si ON rs.asset_id = si.asset_id
+LEFT JOIN latest_pc pc ON rs.asset_id = pc.asset_id;
+create or replace view DRIFT_METRICS(
+	COMPARISON_DATE,
+	TOTAL_ASSETS,
+	FM_AGREEMENTS,
+	FM_AGREEMENT_PCT,
+	STAGE_AGREEMENTS,
+	STAGE_AGREEMENT_PCT,
+	FM_DISAGREEMENTS,
+	STAGE_DISAGREEMENTS
+) as
+SELECT 
+    COMPARISON_DATE,
+    COUNT(*) AS total_assets,
+    SUM(CASE WHEN FAILURE_MODE_AGREES THEN 1 ELSE 0 END) AS fm_agreements,
+    ROUND(SUM(CASE WHEN FAILURE_MODE_AGREES THEN 1 ELSE 0 END)::FLOAT / COUNT(*) * 100, 1) AS fm_agreement_pct,
+    SUM(CASE WHEN STAGE_AGREES THEN 1 ELSE 0 END) AS stage_agreements,
+    ROUND(SUM(CASE WHEN STAGE_AGREES THEN 1 ELSE 0 END)::FLOAT / COUNT(*) * 100, 1) AS stage_agreement_pct,
+    LISTAGG(CASE WHEN NOT FAILURE_MODE_AGREES THEN ASSET_NAME || ' (rule:' || RULE_FAILURE_MODE || ' vs native:' || NATIVE_FAILURE_MODE || ')' END, '; ') AS fm_disagreements,
+    LISTAGG(CASE WHEN NOT STAGE_AGREES THEN ASSET_NAME || ' (rule:' || RULE_STAGE || ' vs native:' || NATIVE_STAGE || ')' END, '; ') AS stage_disagreements
+FROM MFGPULSE_DB.ML_MODELS.DRIFT_COMPARISON
+GROUP BY COMPARISON_DATE
+ORDER BY COMPARISON_DATE DESC;
+create or replace view LIVE_PREDICTIONS_WITH_ANOMALY(
+	ASSET_ID,
+	ASSET_NAME,
+	ASSET_TYPE,
+	LINE_ID,
+	PREDICTION_TIME,
+	FAILURE_MODE_PRED,
+	FAILURE_MODE_CONFIDENCE,
+	RUL_HOURS,
+	RUL_LOWER_CI,
+	RUL_UPPER_CI,
+	STAGE_PRED,
+	DEGRADATION_SCORE,
+	TRANSITION_PROBABILITY,
+	FATIGUE_SCORE,
+	FATIGUE_LEVEL,
+	COMPOSITE_HEALTH_SCORE,
+	STRESS_INDEX,
+	ANOMALY_SCORE
+) as
+SELECT
+    lp.ASSET_ID, lp.ASSET_NAME, lp.ASSET_TYPE, lp.LINE_ID, lp.PREDICTION_TIME,
+    lp.FAILURE_MODE_PRED, lp.FAILURE_MODE_CONFIDENCE, lp.RUL_HOURS,
+    lp.RUL_LOWER_CI, lp.RUL_UPPER_CI, lp.STAGE_PRED, lp.DEGRADATION_SCORE,
+    lp.TRANSITION_PROBABILITY, lp.FATIGUE_SCORE, lp.FATIGUE_LEVEL,
+    lp.COMPOSITE_HEALTH_SCORE, lp.STRESS_INDEX,
+    MFGPULSE_DB.ML_MODELS.ANOMALY_SCORER(
+        rs.VIB_CREST_FACTOR_6H,
+        rs.VIB_CREST_FACTOR_24H,
+        rs.TEMP_RATE_OF_CHANGE_1H,
+        si.ACOUSTIC_VIB_RATIO,
+        pc.ENERGY_BALANCE_RATIO
+    ) AS ANOMALY_SCORE
+FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS lp
+LEFT JOIN (
+    SELECT ASSET_ID, VIB_CREST_FACTOR_6H, VIB_CREST_FACTOR_24H, TEMP_RATE_OF_CHANGE_1H
+    FROM MFGPULSE_DB.ML_FEATURES.ROLLING_STATS
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY ASSET_ID ORDER BY TIMESTAMP DESC) = 1
+) rs ON lp.ASSET_ID = rs.ASSET_ID
+LEFT JOIN (
+    SELECT ASSET_ID, ACOUSTIC_VIB_RATIO
+    FROM MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY ASSET_ID ORDER BY TIMESTAMP DESC) = 1
+) si ON lp.ASSET_ID = si.ASSET_ID
+LEFT JOIN (
+    SELECT ASSET_ID, ENERGY_BALANCE_RATIO
+    FROM MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY ASSET_ID ORDER BY TIMESTAMP DESC) = 1
+) pc ON lp.ASSET_ID = pc.ASSET_ID;
+create or replace view MODEL_ACCURACY_LIVE(
+	TOTAL_FEEDBACK,
+	CORRECT_PREDICTIONS,
+	FAILURE_MODE_ACCURACY_PCT,
+	CORRECT_STAGES,
+	STAGE_ACCURACY_PCT,
+	FALSE_ALARMS,
+	FALSE_ALARM_RATE_PCT,
+	FIRST_FEEDBACK,
+	LAST_FEEDBACK
+) as
+SELECT 
+    COUNT(*) AS total_feedback,
+    SUM(CASE WHEN WAS_CORRECT THEN 1 ELSE 0 END) AS correct_predictions,
+    ROUND(SUM(CASE WHEN WAS_CORRECT THEN 1 ELSE 0 END)::FLOAT / NULLIF(COUNT(*), 0) * 100, 1) AS failure_mode_accuracy_pct,
+    SUM(CASE WHEN STAGE_WAS_CORRECT THEN 1 ELSE 0 END) AS correct_stages,
+    ROUND(SUM(CASE WHEN STAGE_WAS_CORRECT THEN 1 ELSE 0 END)::FLOAT / NULLIF(COUNT(*), 0) * 100, 1) AS stage_accuracy_pct,
+    SUM(CASE WHEN CONFIRMED_ROOT_CAUSE = 'false_alarm' THEN 1 ELSE 0 END) AS false_alarms,
+    ROUND(SUM(CASE WHEN CONFIRMED_ROOT_CAUSE = 'false_alarm' THEN 1 ELSE 0 END)::FLOAT / NULLIF(COUNT(*), 0) * 100, 1) AS false_alarm_rate_pct,
+    MIN(CONFIRMED_AT) AS first_feedback,
+    MAX(CONFIRMED_AT) AS last_feedback
+FROM MFGPULSE_DB.ML_MODELS.FEEDBACK_LOG
+WHERE CONFIRMED_AT >= DATEADD('day', -30, CURRENT_TIMESTAMP());
+CREATE OR REPLACE PROCEDURE "ANALYZE_ROOT_CAUSE"("P_ASSET_ID" VARCHAR, "P_CURRENT_VIB_MAG" FLOAT, "P_CURRENT_TEMP" FLOAT, "P_CURRENT_RPM" FLOAT, "P_CURRENT_AMPS" FLOAT, "P_FATIGUE_SCORE" FLOAT, "P_PREDICTED_FAILURE_MODE" VARCHAR, "P_PREDICTED_RUL_HOURS" FLOAT, "P_DEGRADATION_STAGE" NUMBER(38,0))
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+ARTIFACT_REPOSITORY = snowflake.snowpark.pypi_shared_repository
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
+EXECUTE AS CALLER
+AS '
+import json, re
+
+def run(session, p_asset_id, p_current_vib_mag, p_current_temp, p_current_rpm,
+        p_current_amps, p_fatigue_score, p_predicted_failure_mode,
+        p_predicted_rul_hours, p_degradation_stage):
+
+    search_query = str(p_predicted_failure_mode) + "" "" + str(p_asset_id) + "" degradation failure""
+    fleet_query = str(p_predicted_failure_mode) + "" vibration temperature failure""
+
+    # Retrieve asset-specific maintenance history via Cortex Search
+    try:
+        search_params = json.dumps({
+            ""query"": search_query,
+            ""columns"": [""search_text"", ""asset_id"", ""wo_type""],
+            ""filter"": {""@eq"": {""asset_id"": str(p_asset_id)}},
+            ""limit"": 5
+        })
+        safe_params = search_params.replace(""''"", ""''''"")
+        sql = f""SELECT PARSE_JSON(SNOWFLAKE.CORTEX.SEARCH_PREVIEW(''MFGPULSE_DB.ML_MODELS.MAINTENANCE_SEARCH'', ''{safe_params}''))[''results''] AS results""
+        rows = session.sql(sql).collect()
+        results_arr = json.loads(str(rows[0][""RESULTS""]))
+        asset_history = "" | "".join([r.get(""search_text"", """") for r in results_arr[:5]])
+    except Exception as e:
+        asset_history = ""No maintenance history found. Error: "" + str(e)
+
+    # Retrieve fleet-wide similar failures
+    try:
+        fleet_params = json.dumps({
+            ""query"": fleet_query,
+            ""columns"": [""search_text"", ""asset_id"", ""wo_type""],
+            ""limit"": 5
+        })
+        safe_fleet = fleet_params.replace(""''"", ""''''"")
+        sql2 = f""SELECT PARSE_JSON(SNOWFLAKE.CORTEX.SEARCH_PREVIEW(''MFGPULSE_DB.ML_MODELS.MAINTENANCE_SEARCH'', ''{safe_fleet}''))[''results''] AS results""
+        frows = session.sql(sql2).collect()
+        fleet_arr = json.loads(str(frows[0][""RESULTS""]))
+        fleet_history = "" | "".join([r.get(""search_text"", """") for r in fleet_arr[:5]])
+    except Exception as e:
+        fleet_history = ""No fleet history found. Error: "" + str(e)
+
+    # Build the LLM prompt
+    lines = [
+        ""You are an expert reliability engineer performing root cause analysis."",
+        """",
+        ""CURRENT ASSET STATE:"",
+        ""- Asset ID: "" + str(p_asset_id),
+        ""- Vibration: "" + str(p_current_vib_mag) + "" mm/s"",
+        ""- Temperature: "" + str(p_current_temp) + "" C"",
+        ""- RPM: "" + str(p_current_rpm),
+        ""- Current: "" + str(p_current_amps) + "" A"",
+        ""- Fatigue Score: "" + str(p_fatigue_score) + "" (0=healthy, 1=critical)"",
+        ""- Predicted Failure Mode: "" + str(p_predicted_failure_mode),
+        ""- Predicted RUL: "" + str(p_predicted_rul_hours) + "" hours"",
+        ""- Degradation Stage: "" + str(p_degradation_stage) + ""/4"",
+        """",
+        ""MAINTENANCE HISTORY FOR THIS ASSET:"",
+        asset_history,
+        """",
+        ""SIMILAR FAILURES ACROSS FLEET:"",
+        fleet_history,
+        """",
+        ''Respond ONLY with valid JSON in this exact format:'',
+        ''{""root_cause"": ""specific mechanical root cause"",'',
+        ''""confidence"": 0.9,'',
+        ''""failure_mechanism"": ""bearing_wear or thermal_degradation or imbalance or misalignment or unknown"",'',
+        ''""evidence"": [""evidence 1"", ""evidence 2"", ""evidence 3""],'',
+        ''""contributing_factors"": [""factor 1"", ""factor 2""],'',
+        ''""risk_level"": ""CRITICAL or HIGH or MEDIUM or LOW"",'',
+        ''""recommended_immediate_action"": ""what to do now"",'',
+        ''""similar_past_failure_reference"": ""reference to similar event""}'',
+        """",
+        ""No markdown, no text outside JSON.""
+    ]
+    prompt = chr(10).join(lines)
+
+    safe_prompt = prompt.replace(""''"", ""''''"")
+    llm_sql = f""SELECT SNOWFLAKE.CORTEX.COMPLETE(''llama3.3-70b'', ''{safe_prompt}'') AS response""
+    llm_rows = session.sql(llm_sql).collect()
+    raw = str(llm_rows[0][""RESPONSE""])
+
+    start = raw.find(''{'')
+    end = raw.rfind(''}'') + 1
+    if start != -1 and end > start:
+        try:
+            return json.loads(raw[start:end])
+        except:
+            return {""root_cause"": raw, ""confidence"": 0.5, ""parse_error"": True}
+    return {""root_cause"": raw, ""confidence"": 0.5, ""no_json"": True}
+';
+CREATE OR REPLACE PROCEDURE "ANALYZE_ROOT_CAUSE"("P_ASSET_ID" VARCHAR, "P_VIB_MAG" FLOAT, "P_TEMP" FLOAT, "P_RPM" FLOAT, "P_AMPS" FLOAT, "P_FATIGUE" FLOAT, "P_FAILURE_MODE" VARCHAR, "P_RUL_HOURS" FLOAT, "P_STAGE" VARCHAR)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS 'BEGIN
+    LET asset_ctx VARCHAR := '''';
+    LET fleet_ctx VARCHAR := '''';
+    
+    SELECT ARRAY_TO_STRING(
+        ARRAY_AGG(r.value:search_text::VARCHAR), ''\\n''
+    ) INTO :asset_ctx
+    FROM TABLE(FLATTEN(
+        input => PARSE_JSON(
+            SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
+                ''MFGPULSE_DB.ML_MODELS.MAINTENANCE_SEARCH'',
+                ''{
+                    ""query"": ""'' || :p_failure_mode || '' '' || :p_asset_id || '' failure degradation"",
+                    ""columns"": [""search_text"",""asset_id"",""wo_type""],
+                    ""filter"": {""@eq"": {""asset_id"": ""'' || :p_asset_id || ''""}},
+                    ""limit"": 5
+                }''
+            )
+        )[''results'']
+    )) r;
+
+    SELECT ARRAY_TO_STRING(
+        ARRAY_AGG(r.value:search_text::VARCHAR), ''\\n''
+    ) INTO :fleet_ctx
+    FROM TABLE(FLATTEN(
+        input => PARSE_JSON(
+            SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
+                ''MFGPULSE_DB.ML_MODELS.MAINTENANCE_SEARCH'',
+                ''{
+                    ""query"": ""'' || :p_failure_mode || '' failure root cause repair"",
+                    ""columns"": [""search_text"",""asset_id"",""wo_type""],
+                    ""limit"": 5
+                }''
+            )
+        )[''results'']
+    )) r;
+
+    LET prompt VARCHAR := 
+        ''You are an expert reliability engineer. Analyze this asset condition and provide root cause diagnosis.\\n\\n'' ||
+        ''## CURRENT STATE:\\n'' ||
+        ''- Asset: '' || :p_asset_id || ''\\n'' ||
+        ''- Vibration: '' || :p_vib_mag::VARCHAR || '' mm/s\\n'' ||
+        ''- Temperature: '' || :p_temp::VARCHAR || '' C\\n'' ||
+        ''- RPM: '' || :p_rpm::VARCHAR || ''\\n'' ||
+        ''- Current: '' || :p_amps::VARCHAR || '' A\\n'' ||
+        ''- Fatigue Score: '' || :p_fatigue::VARCHAR || ''/1.0\\n'' ||
+        ''- Predicted Failure: '' || :p_failure_mode || ''\\n'' ||
+        ''- Remaining Life: '' || :p_rul_hours::VARCHAR || '' hours\\n'' ||
+        ''- Stage: '' || :p_stage || ''\\n\\n'' ||
+        ''## MAINTENANCE HISTORY:\\n'' || COALESCE(:asset_ctx, ''None available'') || ''\\n\\n'' ||
+        ''## SIMILAR FLEET FAILURES:\\n'' || COALESCE(:fleet_ctx, ''None available'') || ''\\n\\n'' ||
+        ''RESPOND IN VALID JSON ONLY. No markdown, no explanation outside JSON:\\n'' ||
+        ''{""root_cause"":""<specific mechanical root cause in 1-2 sentences>"",'' ||
+        ''""confidence"":<0.0 to 1.0>,'' ||
+        ''""failure_mechanism"":""<bearing_wear|thermal_degradation|imbalance|misalignment|unknown>"",'' ||
+        ''""evidence"":[""<evidence 1>"",""<evidence 2>"",""<evidence 3>""],'' ||
+        ''""risk_level"":""<CRITICAL|HIGH|MEDIUM|LOW>"",'' ||
+        ''""recommended_action"":""<specific action with part numbers if applicable>""}'';
+
+    LET llm_response VARCHAR;
+    SELECT SNOWFLAKE.CORTEX.COMPLETE(''llama3.1-70b'', :prompt) INTO :llm_response;
+
+    LET result VARIANT;
+    SELECT TRY_PARSE_JSON(REGEXP_SUBSTR(:llm_response, ''\\\\{[\\\\s\\\\S]*\\\\}'')) INTO :result;
+    
+    RETURN :result;
+END';
+CREATE OR REPLACE FUNCTION "ANOMALY_SCORER"("VIB_CREST_FACTOR_6H" FLOAT, "VIB_CREST_FACTOR_24H" FLOAT, "TEMP_RATE_OF_CHANGE" FLOAT, "ACOUSTIC_VIB_RATIO" FLOAT, "ENERGY_BALANCE_RATIO" FLOAT)
+RETURNS FLOAT
+LANGUAGE SQL
+AS '
+    -- M8: Statistical anomaly scorer (0 = normal, 1 = highly anomalous)
+    -- Uses Z-score deviation from healthy baselines across 5 signals.
+    -- Healthy baselines derived from HEALTHY_DERIVED_FEATURES training data.
+    LEAST(1.0, GREATEST(0.0,
+        (
+            -- Signal 1: Vibration crest factor 6h (healthy mean=1.1443, std=0.0347)
+            LEAST(3.0, ABS(VIB_CREST_FACTOR_6H - 1.1443) / NULLIF(0.0347, 0)) / 3.0 * 0.25 +
+
+            -- Signal 2: Vibration crest factor 24h (healthy mean=1.1729, std=0.0318)
+            LEAST(3.0, ABS(VIB_CREST_FACTOR_24H - 1.1729) / NULLIF(0.0318, 0)) / 3.0 * 0.20 +
+
+            -- Signal 3: Temperature rate of change (healthy mean=0, std=1.605)
+            LEAST(3.0, ABS(COALESCE(TEMP_RATE_OF_CHANGE, 0)) / NULLIF(1.605, 0)) / 3.0 * 0.20 +
+
+            -- Signal 4: Acoustic-vibration ratio (healthy mean=25.2554, std=4.6552)
+            LEAST(3.0, ABS(COALESCE(ACOUSTIC_VIB_RATIO, 25.2554) - 25.2554) / NULLIF(4.6552, 0)) / 3.0 * 0.15 +
+
+            -- Signal 5: Energy balance ratio (healthy mean=14.7049, std=12.2242)
+            LEAST(3.0, ABS(COALESCE(ENERGY_BALANCE_RATIO, 14.7049) - 14.7049) / NULLIF(12.2242, 0)) / 3.0 * 0.20
+        )
+    ))
+';
+CREATE OR REPLACE FUNCTION "COMPUTE_FATIGUE_SCORE"("VIB_CREST_FACTOR_6H" FLOAT, "VIB_COEFF_VAR_6H" FLOAT, "VIB_PEAK_TO_PEAK_6H" FLOAT, "VIB_RATE_OF_CHANGE_1H" FLOAT, "VIB_ACCELERATION_1H" FLOAT, "ENERGY_BALANCE_RATIO" FLOAT, "STRESS_INDEX" FLOAT, "VIB_XY_CORRELATION" FLOAT, "ACOUSTIC_VIB_RATIO" FLOAT)
+RETURNS FLOAT
+LANGUAGE SQL
+AS '
+    -- Multi-signal fatigue score (0 = healthy, 1 = critical fatigue)
+    -- Each component detects a different fatigue mechanism
+    LEAST(1.0, GREATEST(0.0,
+        -- Component 1: Impulsiveness (kurtosis proxy via crest factor)
+        -- High crest factor = sharp impacts = bearing pitting
+        LEAST(1.0, GREATEST(0, (vib_crest_factor_6h - 1.2) / 1.5)) * 0.25
+
+        -- Component 2: Signal instability (coefficient of variation)
+        -- High CoV = intermittent contact / looseness
+        + LEAST(1.0, GREATEST(0, (vib_coeff_var_6h - 0.15) / 0.4)) * 0.15
+
+        -- Component 3: Degradation acceleration (2nd derivative)
+        -- Positive acceleration = failure approaching faster
+        + LEAST(1.0, GREATEST(0, vib_acceleration_1h / 2.0)) * 0.20
+
+        -- Component 4: Energy inefficiency
+        -- Divergence from 1.0 = energy loss to friction/misalignment
+        + LEAST(1.0, GREATEST(0, ABS(energy_balance_ratio - 1.0) / 0.5)) * 0.15
+
+        -- Component 5: Multi-axis correlation shift
+        -- Sudden correlation change = new failure mode developing
+        + LEAST(1.0, GREATEST(0, ABS(vib_xy_correlation - 0.3) / 0.5)) * 0.10
+
+        -- Component 6: Acoustic-vibration decoupling
+        -- Rising acoustic with stable vibration = internal crack
+        + LEAST(1.0, GREATEST(0, (acoustic_vib_ratio - 25.0) / 20.0)) * 0.15
+    ))
+';
+CREATE OR REPLACE PROCEDURE "COMPUTE_NATIVE_PREDICTIONS"()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS 'BEGIN
+    LET fm_ok BOOLEAN := FALSE;
+    LET stage_ok BOOLEAN := FALSE;
+
+    DELETE FROM MFGPULSE_DB.ML_MODELS.DRIFT_COMPARISON
+    WHERE COMPARISON_DATE = CURRENT_DATE();
+
+    CREATE OR REPLACE TEMPORARY VIEW MFGPULSE_DB.ML_MODELS._INFERENCE_FM AS
+    SELECT 
+        rs.asset_id,
+        rs.vib_mag_mean_6h, rs.vib_mag_std_6h, rs.vib_mag_max_6h, rs.vib_crest_factor_6h,
+        rs.vib_peak_to_peak_6h, rs.vib_rms_6h, rs.vib_coeff_var_6h,
+        rs.temp_mean_6h, rs.temp_std_6h, rs.current_mean_6h, rs.current_std_6h,
+        rs.vib_mag_mean_24h, rs.vib_mag_std_24h, rs.vib_crest_factor_24h, rs.vib_rms_24h,
+        rs.temp_mean_24h, rs.current_mean_24h, rs.acoustic_mean_24h,
+        rs.vib_rate_of_change_1h, rs.vib_acceleration_1h,
+        COALESCE(si.vib_xy_correlation_daily, 0) AS vib_xy_correlation_daily,
+        COALESCE(si.vib_temp_coupling_daily, 0) AS vib_temp_coupling_daily,
+        COALESCE(si.current_rpm_ratio, 0) AS current_rpm_ratio,
+        COALESCE(si.vib_axis_dominance, 0.5) AS vib_axis_dominance,
+        COALESCE(si.acoustic_vib_ratio, 0) AS acoustic_vib_ratio,
+        pc.stress_index, pc.iso_10816_severity, pc.composite_health_score
+    FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn 
+          FROM MFGPULSE_DB.ML_FEATURES.ROLLING_STATS QUALIFY rn = 1) rs
+    LEFT JOIN (SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn 
+               FROM MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS QUALIFY rn = 1) si ON rs.asset_id = si.asset_id
+    LEFT JOIN (SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn 
+               FROM MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE QUALIFY rn = 1) pc ON rs.asset_id = pc.asset_id;
+
+    CREATE OR REPLACE TEMPORARY VIEW MFGPULSE_DB.ML_MODELS._INFERENCE_STAGE AS
+    SELECT 
+        rs.asset_id,
+        rs.vib_mag_mean_6h, rs.vib_mag_std_6h, rs.vib_mag_max_6h, rs.vib_crest_factor_6h,
+        rs.vib_rms_6h, rs.vib_peak_to_peak_6h, rs.temp_mean_6h, rs.current_mean_6h,
+        rs.vib_mag_mean_24h, rs.vib_rms_24h, rs.vib_coeff_var_24h,
+        rs.vib_rate_of_change_1h, rs.vib_acceleration_1h,
+        COALESCE(si.vib_xy_correlation_daily, 0) AS vib_xy_correlation_daily,
+        COALESCE(si.current_rpm_ratio, 0) AS current_rpm_ratio,
+        COALESCE(si.vib_axis_dominance, 0.5) AS vib_axis_dominance,
+        COALESCE(tm.hours_since_first_breach, 0) AS hours_since_first_breach,
+        COALESCE(tm.degradation_velocity_30d, 0) AS degradation_velocity_30d,
+        COALESCE(tm.above_normal_count_24h, 0) AS above_normal_count_24h,
+        COALESCE(tm.vib_trend_72h, 0) AS vib_trend_72h,
+        COALESCE(cd.days_since_last_maintenance, 0) AS days_since_last_maintenance,
+        COALESCE(cd.cumulative_operating_hours, 0) AS cumulative_operating_hours,
+        pc.stress_index, pc.composite_health_score, pc.iso_10816_severity
+    FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn 
+          FROM MFGPULSE_DB.ML_FEATURES.ROLLING_STATS QUALIFY rn = 1) rs
+    LEFT JOIN (SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn 
+               FROM MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS QUALIFY rn = 1) si ON rs.asset_id = si.asset_id
+    LEFT JOIN (SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn 
+               FROM MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE QUALIFY rn = 1) pc ON rs.asset_id = pc.asset_id
+    LEFT JOIN (SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn 
+               FROM MFGPULSE_DB.ML_FEATURES.TEMPORAL_MEMORY QUALIFY rn = 1) tm ON rs.asset_id = tm.asset_id
+    LEFT JOIN (SELECT *, ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY timestamp DESC) AS rn 
+               FROM MFGPULSE_DB.ML_FEATURES.CROSS_DOMAIN QUALIFY rn = 1) cd ON rs.asset_id = cd.asset_id;
+
+    BEGIN
+        CREATE OR REPLACE TEMPORARY TABLE MFGPULSE_DB.ML_MODELS._NATIVE_FM_RESULTS AS
+        SELECT inf.asset_id, res."class" AS native_failure_mode
+        FROM MFGPULSE_DB.ML_MODELS._INFERENCE_FM inf
+        JOIN TABLE(MFGPULSE_DB.ML_MODELS.NATIVE_FAILURE_MODE_CLASSIFIER!PREDICT(
+            INPUT_DATA => SYSTEM$REFERENCE(''VIEW'', ''MFGPULSE_DB.ML_MODELS._INFERENCE_FM'')
+        )) res ON inf.asset_id = res."ASSET_ID";
+        fm_ok := TRUE;
+    EXCEPTION
+        WHEN OTHER THEN
+            CREATE OR REPLACE TEMPORARY TABLE MFGPULSE_DB.ML_MODELS._NATIVE_FM_RESULTS (
+                asset_id VARCHAR(20), native_failure_mode VARCHAR(50));
+    END;
+
+    BEGIN
+        CREATE OR REPLACE TEMPORARY TABLE MFGPULSE_DB.ML_MODELS._NATIVE_STAGE_RESULTS AS
+        SELECT inf.asset_id, res."class" AS native_stage
+        FROM MFGPULSE_DB.ML_MODELS._INFERENCE_STAGE inf
+        JOIN TABLE(MFGPULSE_DB.ML_MODELS.NATIVE_DEGRADATION_STAGER!PREDICT(
+            INPUT_DATA => SYSTEM$REFERENCE(''VIEW'', ''MFGPULSE_DB.ML_MODELS._INFERENCE_STAGE'')
+        )) res ON inf.asset_id = res."ASSET_ID";
+        stage_ok := TRUE;
+    EXCEPTION
+        WHEN OTHER THEN
+            CREATE OR REPLACE TEMPORARY TABLE MFGPULSE_DB.ML_MODELS._NATIVE_STAGE_RESULTS (
+                asset_id VARCHAR(20), native_stage VARCHAR(50));
+    END;
+
+    INSERT INTO MFGPULSE_DB.ML_MODELS.DRIFT_COMPARISON
+        (COMPARISON_DATE, ASSET_ID, ASSET_NAME, RULE_FAILURE_MODE, NATIVE_FAILURE_MODE,
+         RULE_STAGE, NATIVE_STAGE, FAILURE_MODE_AGREES, STAGE_AGREES,
+         RULE_DEGRADATION_SCORE, NATIVE_DEGRADATION_SCORE, COMPARED_AT)
+    SELECT
+        CURRENT_DATE(), lp.asset_id, lp.asset_name,
+        lp.failure_mode_pred,
+        COALESCE(nfm.native_failure_mode, ''UNAVAILABLE''),
+        lp.stage_pred,
+        COALESCE(nst.native_stage, ''UNAVAILABLE''),
+        COALESCE(lp.failure_mode_pred = nfm.native_failure_mode, FALSE),
+        COALESCE(lp.stage_pred = nst.native_stage, FALSE),
+        lp.degradation_score, NULL, CURRENT_TIMESTAMP()
+    FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS lp
+    LEFT JOIN MFGPULSE_DB.ML_MODELS._NATIVE_FM_RESULTS nfm ON lp.asset_id = nfm.asset_id
+    LEFT JOIN MFGPULSE_DB.ML_MODELS._NATIVE_STAGE_RESULTS nst ON lp.asset_id = nst.asset_id;
+
+    DROP VIEW IF EXISTS MFGPULSE_DB.ML_MODELS._INFERENCE_FM;
+    DROP VIEW IF EXISTS MFGPULSE_DB.ML_MODELS._INFERENCE_STAGE;
+    DROP TABLE IF EXISTS MFGPULSE_DB.ML_MODELS._NATIVE_FM_RESULTS;
+    DROP TABLE IF EXISTS MFGPULSE_DB.ML_MODELS._NATIVE_STAGE_RESULTS;
+
+    LET msg VARCHAR := ''Drift comparison updated for '' || CURRENT_DATE()::VARCHAR;
+    IF (:fm_ok) THEN
+        msg := :msg || ''. FM classifier: OK'';
+    ELSE
+        msg := :msg || ''. FM classifier: FAILED (all UNAVAILABLE)'';
+    END IF;
+    IF (:stage_ok) THEN
+        msg := :msg || ''. Stage classifier: OK'';
+    ELSE
+        msg := :msg || ''. Stage classifier: FAILED (all UNAVAILABLE)'';
+    END IF;
+    RETURN :msg;
+END';
+CREATE OR REPLACE PROCEDURE "LOG_FEEDBACK"("P_WO_ID" VARCHAR, "P_ASSET_ID" VARCHAR, "P_ROOT_CAUSE" VARCHAR, "P_CONFIRMED_BY" VARCHAR)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+DECLARE
+    v_predicted_fm VARCHAR;
+    v_predicted_stage VARCHAR;
+BEGIN
+    -- Get the current prediction for this asset
+    BEGIN
+        SELECT FAILURE_MODE_PRED, STAGE_PRED INTO :v_predicted_fm, :v_predicted_stage
+        FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS
+        WHERE ASSET_ID = :P_ASSET_ID;
+    EXCEPTION WHEN OTHER THEN
+        v_predicted_fm := ''unknown'';
+        v_predicted_stage := ''unknown'';
+    END;
+    
+    INSERT INTO MFGPULSE_DB.ML_MODELS.FEEDBACK_LOG
+        (WO_ID, ASSET_ID, PREDICTED_FAILURE_MODE, PREDICTED_STAGE, CONFIRMED_ROOT_CAUSE, WAS_CORRECT, STAGE_WAS_CORRECT, CONFIRMED_BY)
+    VALUES (
+        :P_WO_ID, :P_ASSET_ID, :v_predicted_fm, :v_predicted_stage, :P_ROOT_CAUSE,
+        :v_predicted_fm = :P_ROOT_CAUSE,
+        CASE WHEN :P_ROOT_CAUSE = ''false_alarm'' THEN :v_predicted_stage = ''Healthy'' ELSE :v_predicted_stage != ''Healthy'' END,
+        :P_CONFIRMED_BY
+    );
+    
+    RETURN ''Feedback logged: predicted='' || :v_predicted_fm || '', confirmed='' || :P_ROOT_CAUSE || '', correct='' || (:v_predicted_fm = :P_ROOT_CAUSE)::VARCHAR;
+END;
+';
+CREATE OR REPLACE PROCEDURE "PREDICT_ALL"("P_ASSET_ID" VARCHAR)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+DECLARE
+    v_asset_name VARCHAR;
+    v_vib_mag FLOAT; v_temp FLOAT; v_rpm FLOAT; v_amps FLOAT; v_acoustic FLOAT; v_health FLOAT;
+    v_rms_24h FLOAT; v_crest_6h FLOAT; v_stress FLOAT; v_composite_health FLOAT;
+    v_deg_velocity FLOAT; v_hours_breach FLOAT; v_above_normal FLOAT;
+    v_vib_mean_6h FLOAT; v_vib_std_6h FLOAT; v_vib_max_6h FLOAT;
+    v_pp_6h FLOAT; v_rms_6h FLOAT; v_cv_6h FLOAT;
+    v_temp_mean_6h FLOAT; v_temp_std_6h FLOAT;
+    v_current_mean_6h FLOAT; v_current_std_6h FLOAT;
+    v_vib_std_24h FLOAT; v_crest_24h FLOAT;
+    v_temp_24h FLOAT; v_current_24h FLOAT; v_acoustic_24h FLOAT;
+    v_roc FLOAT; v_accel FLOAT;
+    v_xy_corr FLOAT; v_vt_coupling FLOAT; v_crpm_ratio FLOAT; v_axis_dom FLOAT; v_av_ratio FLOAT;
+    v_iso FLOAT;
+    v_fatigue FLOAT;
+    v_m1_result OBJECT; v_m2_result OBJECT; v_m3_result OBJECT; v_m6_result OBJECT;
+    v_m5_raw VARCHAR; v_m7_raw VARCHAR;
+    v_failure_mode VARCHAR; v_rul_hours FLOAT; v_stage VARCHAR;
+BEGIN
+    -- Get asset info
+    SELECT asset_name INTO :v_asset_name FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER WHERE asset_id = :p_asset_id;
+
+    -- Get current health
+    SELECT current_vib_magnitude, current_temperature, current_rpm, current_amps, current_acoustic_db, health_score
+    INTO :v_vib_mag, :v_temp, :v_rpm, :v_amps, :v_acoustic, :v_health
+    FROM MFGPULSE_DB.CURATED.ASSET_HEALTH_CURRENT WHERE asset_id = :p_asset_id;
+
+    -- Get rolling stats features
+    SELECT vib_mag_mean_6h, vib_mag_std_6h, vib_mag_max_6h, vib_crest_factor_6h,
+           vib_peak_to_peak_6h, vib_rms_6h, vib_coeff_var_6h,
+           temp_mean_6h, temp_std_6h, current_mean_6h, current_std_6h,
+           vib_mag_std_24h, vib_crest_factor_24h, vib_rms_24h,
+           temp_mean_24h, current_mean_24h, acoustic_mean_24h,
+           vib_rate_of_change_1h, vib_acceleration_1h
+    INTO :v_vib_mean_6h, :v_vib_std_6h, :v_vib_max_6h, :v_crest_6h,
+         :v_pp_6h, :v_rms_6h, :v_cv_6h,
+         :v_temp_mean_6h, :v_temp_std_6h, :v_current_mean_6h, :v_current_std_6h,
+         :v_vib_std_24h, :v_crest_24h, :v_rms_24h,
+         :v_temp_24h, :v_current_24h, :v_acoustic_24h,
+         :v_roc, :v_accel
+    FROM MFGPULSE_DB.ML_FEATURES.ROLLING_STATS
+    WHERE asset_id = :p_asset_id ORDER BY timestamp DESC LIMIT 1;
+
+    -- Get sensor interaction features
+    SELECT vib_xy_correlation_daily, vib_temp_coupling_daily, current_rpm_ratio, vib_axis_dominance, acoustic_vib_ratio
+    INTO :v_xy_corr, :v_vt_coupling, :v_crpm_ratio, :v_axis_dom, :v_av_ratio
+    FROM MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS
+    WHERE asset_id = :p_asset_id ORDER BY timestamp DESC LIMIT 1;
+
+    -- Get temporal + physics features
+    SELECT tm.degradation_velocity_30d, tm.hours_since_first_breach, tm.above_normal_count_24h,
+           pc.stress_index, pc.composite_health_score, pc.iso_10816_severity
+    INTO :v_deg_velocity, :v_hours_breach, :v_above_normal, :v_stress, :v_composite_health, :v_iso
+    FROM MFGPULSE_DB.ML_FEATURES.TEMPORAL_MEMORY tm
+    JOIN MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE pc ON tm.asset_id = pc.asset_id AND tm.timestamp = pc.timestamp
+    WHERE tm.asset_id = :p_asset_id ORDER BY tm.timestamp DESC LIMIT 1;
+
+    -- Get fatigue score
+    v_fatigue := 0;
+    BEGIN
+        SELECT fatigue_score INTO :v_fatigue
+        FROM MFGPULSE_DB.ML_MODELS.FATIGUE_SCORES
+        WHERE asset_id = :p_asset_id ORDER BY timestamp DESC LIMIT 1;
+    EXCEPTION WHEN OTHER THEN v_fatigue := 0;
+    END;
+
+    -- ===== M1: Failure Mode =====
+    SELECT MFGPULSE_DB.ML_MODELS.PREDICT_FAILURE_MODE(
+        :v_vib_mean_6h, :v_vib_std_6h, :v_vib_max_6h, :v_crest_6h, :v_pp_6h, :v_rms_6h, :v_cv_6h,
+        :v_temp_mean_6h, :v_temp_std_6h, :v_current_mean_6h, :v_current_std_6h,
+        :v_rms_24h, :v_vib_std_24h, :v_crest_24h, :v_rms_24h,
+        :v_temp_24h, :v_current_24h, :v_acoustic_24h,
+        :v_roc, :v_accel,
+        :v_xy_corr, :v_vt_coupling, :v_crpm_ratio, :v_axis_dom, :v_av_ratio,
+        :v_stress, :v_iso, :v_composite_health
+    ) INTO :v_m1_result;
+    v_failure_mode := :v_m1_result[''predicted_failure_mode'']::VARCHAR;
+
+    -- ===== M2: RUL =====
+    SELECT MFGPULSE_DB.ML_MODELS.PREDICT_RUL(
+        :v_rms_24h, :v_roc, :v_accel, :v_deg_velocity, :v_hours_breach, :v_stress, :v_composite_health, :v_fatigue
+    ) INTO :v_m2_result;
+    v_rul_hours := :v_m2_result[''predicted_rul_hours'']::FLOAT;
+
+    -- ===== M3: Degradation Stage =====
+    SELECT MFGPULSE_DB.ML_MODELS.PREDICT_DEGRADATION_STAGE(
+        :v_rms_24h, :v_crest_6h, :v_stress, :v_composite_health, :v_deg_velocity, :v_hours_breach, :v_above_normal
+    ) INTO :v_m3_result;
+    v_stage := :v_m3_result[''predicted_stage'']::VARCHAR;
+
+    -- ===== M4: Fatigue Score (already computed) =====
+
+    -- ===== M5: Root Cause (LLM) =====
+    CALL MFGPULSE_DB.ML_MODELS.ANALYZE_ROOT_CAUSE(
+        :p_asset_id, :v_vib_mag, :v_temp, :v_rpm, :v_amps, :v_fatigue,
+        :v_failure_mode, :v_rul_hours, :v_stage
+    );
+    SELECT * INTO :v_m5_raw FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+
+    -- ===== M6: Simulation =====
+    SELECT MFGPULSE_DB.ML_MODELS.SIMULATE_FAILURE_TWIN(
+        :v_vib_mag, COALESCE(:v_deg_velocity, 0.1), COALESCE(:v_fatigue, 0.5), 0, 7, 0
+    ) INTO :v_m6_result;
+
+    -- ===== M7: Prescriptive AI (LLM) =====
+    CALL MFGPULSE_DB.ML_MODELS.PRESCRIBE_MAINTENANCE(
+        :p_asset_id, :v_failure_mode, :v_rul_hours, :v_stage, :v_fatigue,
+        TRY_PARSE_JSON(:v_m5_raw):root_cause::VARCHAR,
+        :v_m6_result::VARCHAR
+    );
+    SELECT * INTO :v_m7_raw FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+
+    -- ===== ASSEMBLE RESULT =====
+    RETURN OBJECT_CONSTRUCT(
+        ''asset_id'', :p_asset_id,
+        ''asset_name'', :v_asset_name,
+        ''current_state'', OBJECT_CONSTRUCT(
+            ''vibration_mm_s'', ROUND(:v_vib_mag, 2),
+            ''temperature_c'', ROUND(:v_temp, 1),
+            ''rpm'', ROUND(:v_rpm, 0),
+            ''current_amps'', ROUND(:v_amps, 1),
+            ''health_score'', ROUND(:v_health, 0),
+            ''fatigue_score'', ROUND(:v_fatigue, 3)
+        ),
+        ''M1_failure_mode'', :v_m1_result,
+        ''M2_remaining_useful_life'', :v_m2_result,
+        ''M3_degradation_stage'', :v_m3_result,
+        ''M4_fatigue_score'', ROUND(:v_fatigue, 3),
+        ''M5_root_cause'', TRY_PARSE_JSON(:v_m5_raw),
+        ''M6_simulation'', :v_m6_result,
+        ''M7_prescription'', TRY_PARSE_JSON(:v_m7_raw)
+    );
+EXCEPTION
+    WHEN OTHER THEN
+        RETURN OBJECT_CONSTRUCT(''error'', SQLERRM, ''asset_id'', :p_asset_id);
+END;
+';
+CREATE OR REPLACE FUNCTION "PREDICT_DEGRADATION_STAGE"("VIB_RMS_24H" FLOAT, "VIB_CREST_FACTOR_6H" FLOAT, "STRESS_INDEX" FLOAT, "COMPOSITE_HEALTH_SCORE" FLOAT, "DEGRADATION_VELOCITY_30D" FLOAT, "HOURS_SINCE_FIRST_BREACH" FLOAT, "ABOVE_NORMAL_COUNT_24H" FLOAT)
+RETURNS OBJECT
+LANGUAGE SQL
+AS '
+    SELECT OBJECT_CONSTRUCT(
+        ''predicted_stage'', 
+        CASE 
+            WHEN (LEAST(1.0, GREATEST(0, (vib_rms_24h - 2.5)/10.0)) * 0.25 +
+                  LEAST(1.0, GREATEST(0, (vib_crest_factor_6h - 1.2)/1.5)) * 0.15 +
+                  LEAST(1.0, stress_index) * 0.15 +
+                  LEAST(1.0, GREATEST(0, COALESCE(degradation_velocity_30d, 0)/0.5)) * 0.20 +
+                  CASE WHEN hours_since_first_breach IS NULL THEN 0 ELSE LEAST(1.0, hours_since_first_breach/2000.0) END * 0.10 +
+                  LEAST(1.0, COALESCE(above_normal_count_24h, 0)/80.0) * 0.15
+            ) < 0.30 THEN ''Healthy''
+            WHEN (LEAST(1.0, GREATEST(0, (vib_rms_24h - 2.5)/10.0)) * 0.25 +
+                  LEAST(1.0, GREATEST(0, (vib_crest_factor_6h - 1.2)/1.5)) * 0.15 +
+                  LEAST(1.0, stress_index) * 0.15 +
+                  LEAST(1.0, GREATEST(0, COALESCE(degradation_velocity_30d, 0)/0.5)) * 0.20 +
+                  CASE WHEN hours_since_first_breach IS NULL THEN 0 ELSE LEAST(1.0, hours_since_first_breach/2000.0) END * 0.10 +
+                  LEAST(1.0, COALESCE(above_normal_count_24h, 0)/80.0) * 0.15
+            ) < 0.65 THEN ''Warning''
+            ELSE ''Critical''
+        END,
+        ''degradation_score'', 
+        ROUND(LEAST(1.0, GREATEST(0, (vib_rms_24h - 2.5)/10.0)) * 0.25 +
+              LEAST(1.0, GREATEST(0, (vib_crest_factor_6h - 1.2)/1.5)) * 0.15 +
+              LEAST(1.0, stress_index) * 0.15 +
+              LEAST(1.0, GREATEST(0, COALESCE(degradation_velocity_30d, 0)/0.5)) * 0.20 +
+              CASE WHEN hours_since_first_breach IS NULL THEN 0 ELSE LEAST(1.0, hours_since_first_breach/2000.0) END * 0.10 +
+              LEAST(1.0, COALESCE(above_normal_count_24h, 0)/80.0) * 0.15, 4),
+        ''transition_probability'',
+        ROUND(LEAST(1.0, GREATEST(0, COALESCE(degradation_velocity_30d, 0)/0.5)) * 0.5 +
+              LEAST(1.0, COALESCE(above_normal_count_24h, 0)/80.0) * 0.5, 4)
+    )
+';
+CREATE OR REPLACE FUNCTION "PREDICT_FAILURE_MODE"("VIB_MAG_MEAN_6H" FLOAT, "VIB_MAG_STD_6H" FLOAT, "VIB_MAG_MAX_6H" FLOAT, "VIB_CREST_FACTOR_6H" FLOAT, "VIB_PEAK_TO_PEAK_6H" FLOAT, "VIB_RMS_6H" FLOAT, "VIB_COEFF_VAR_6H" FLOAT, "TEMP_MEAN_6H" FLOAT, "TEMP_STD_6H" FLOAT, "CURRENT_MEAN_6H" FLOAT, "CURRENT_STD_6H" FLOAT, "VIB_MAG_MEAN_24H" FLOAT, "VIB_MAG_STD_24H" FLOAT, "VIB_CREST_FACTOR_24H" FLOAT, "VIB_RMS_24H" FLOAT, "TEMP_MEAN_24H" FLOAT, "CURRENT_MEAN_24H" FLOAT, "ACOUSTIC_MEAN_24H" FLOAT, "VIB_RATE_OF_CHANGE_1H" FLOAT, "VIB_ACCELERATION_1H" FLOAT, "VIB_XY_CORRELATION" FLOAT, "VIB_TEMP_COUPLING" FLOAT, "CURRENT_RPM_RATIO" FLOAT, "VIB_AXIS_DOMINANCE" FLOAT, "ACOUSTIC_VIB_RATIO" FLOAT, "STRESS_INDEX" FLOAT, "ISO_SEVERITY" FLOAT, "COMPOSITE_HEALTH" FLOAT)
+RETURNS OBJECT
+LANGUAGE SQL
+AS '
+    -- Physics-informed failure mode classification
+    -- Encodes domain knowledge: which signal patterns map to which failure modes
+    SELECT OBJECT_CONSTRUCT(
+        ''predicted_failure_mode'',
+        CASE
+            -- Bearing wear: high crest factor + high acoustic + rising vibration
+            WHEN vib_crest_factor_6h > 1.5 AND acoustic_vib_ratio > 20 AND vib_rms_24h > 5.0
+                THEN ''bearing_wear''
+            -- Thermal degradation: high temp + low vibration + efficiency loss
+            WHEN temp_mean_24h > 70 AND vib_rms_24h < 4.0 AND stress_index > 0.5
+                THEN ''thermal_degradation''
+            -- Misalignment: multi-axis correlation + high current + moderate vibration
+            WHEN ABS(vib_xy_correlation) > 0.6 AND current_rpm_ratio > 8.0 AND vib_axis_dominance < 0.7
+                THEN ''misalignment''
+            -- Imbalance: single-axis dominant + RPM-dependent vibration
+            WHEN vib_axis_dominance > 0.75 AND vib_rms_24h > 4.0 AND current_rpm_ratio < 7.0
+                THEN ''imbalance''
+            -- Normal
+            ELSE ''normal''
+        END,
+        ''confidence'', 
+        CASE 
+            WHEN composite_health < 30 THEN 0.95
+            WHEN composite_health < 60 THEN 0.80
+            WHEN composite_health < 80 THEN 0.65
+            ELSE 0.90
+        END,
+        ''prob_bearing_wear'', ROUND(LEAST(1, GREATEST(0, (vib_crest_factor_6h - 1.0) / 2.0 * (acoustic_vib_ratio / 40.0))), 4),
+        ''prob_thermal'', ROUND(LEAST(1, GREATEST(0, (temp_mean_24h - 50) / 50.0 * (1 - vib_rms_24h / 15.0))), 4),
+        ''prob_misalignment'', ROUND(LEAST(1, GREATEST(0, ABS(vib_xy_correlation) * current_rpm_ratio / 15.0)), 4),
+        ''prob_imbalance'', ROUND(LEAST(1, GREATEST(0, vib_axis_dominance * vib_rms_24h / 10.0)), 4),
+        ''prob_normal'', ROUND(GREATEST(0, 1 - stress_index), 4)
+    )
+';
+CREATE OR REPLACE FUNCTION "PREDICT_RUL"("VIB_RMS_24H" FLOAT, "VIB_RATE_OF_CHANGE" FLOAT, "VIB_ACCELERATION" FLOAT, "DEGRADATION_VELOCITY" FLOAT, "HOURS_SINCE_BREACH" FLOAT, "STRESS_INDEX" FLOAT, "COMPOSITE_HEALTH" FLOAT, "FATIGUE_SCORE" FLOAT)
+RETURNS OBJECT
+LANGUAGE SQL
+AS '
+    -- Physics-based RUL estimation with confidence intervals
+    -- Uses degradation rate + remaining capacity to estimate hours to failure
+    SELECT OBJECT_CONSTRUCT(
+        ''predicted_rul_hours'', ROUND(GREATEST(0,
+            CASE 
+                WHEN COALESCE(degradation_velocity, 0) > 0.01 THEN
+                    -- Rate-based: remaining capacity / degradation rate
+                    (1.0 - COALESCE(fatigue_score, stress_index)) / (degradation_velocity / 24.0)
+                WHEN stress_index > 0.7 THEN
+                    -- High stress but low velocity: use stress-based estimate
+                    (1.0 - stress_index) * 500.0
+                ELSE
+                    -- Low degradation: long RUL
+                    2000.0
+            END
+        ), 1),
+        ''rul_lower_ci'', ROUND(GREATEST(0,
+            CASE 
+                WHEN COALESCE(degradation_velocity, 0) > 0.01 THEN
+                    (1.0 - COALESCE(fatigue_score, stress_index)) / (degradation_velocity * 1.5 / 24.0)
+                ELSE 1500.0
+            END
+        ), 1),
+        ''rul_upper_ci'', ROUND(GREATEST(0,
+            CASE 
+                WHEN COALESCE(degradation_velocity, 0) > 0.01 THEN
+                    (1.0 - COALESCE(fatigue_score, stress_index)) / (degradation_velocity * 0.5 / 24.0)
+                ELSE 3000.0
+            END
+        ), 1),
+        ''confidence_level'', CASE
+            WHEN COALESCE(degradation_velocity, 0) > 0.1 THEN ''HIGH''
+            WHEN COALESCE(degradation_velocity, 0) > 0.01 THEN ''MEDIUM''
+            ELSE ''LOW''
+        END
+    )
+';
+CREATE OR REPLACE PROCEDURE "PRESCRIBE_MAINTENANCE"("P_ASSET_ID" VARCHAR, "P_FAILURE_MODE" VARCHAR, "P_RUL_HOURS" FLOAT, "P_STAGE" VARCHAR, "P_FATIGUE_SCORE" FLOAT, "P_ROOT_CAUSE" VARCHAR, "P_SIM_RESULT" VARCHAR)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+DECLARE
+    parts_info VARCHAR DEFAULT ''None'';
+    shift_info VARCHAR DEFAULT ''Next available'';
+    avg_cost FLOAT DEFAULT 1000;
+    fail_cost FLOAT DEFAULT 5000;
+    prompt VARCHAR;
+    llm_response VARCHAR;
+BEGIN
+    SELECT COALESCE(ARRAY_TO_STRING(ARRAY_AGG(
+        part_name || '' (qty:'' || quantity_on_hand || '', $'' || unit_cost || '')''
+    ), ''; ''), ''None'') INTO :parts_info
+    FROM MFGPULSE_DB.RAW_IT.PARTS_INVENTORY
+    WHERE ARRAY_CONTAINS(:p_asset_id::VARIANT, compatible_assets);
+
+    fail_cost := CASE WHEN :p_stage = ''Critical'' THEN 12000 ELSE 5000 END;
+
+    prompt := CONCAT(
+        ''Maintenance AI. Asset '', :p_asset_id, '' has '', :p_failure_mode, '', '', :p_rul_hours::VARCHAR, ''hrs RUL, '', :p_stage,
+        ''. Fatigue:'', :p_fatigue_score::VARCHAR, ''. Root cause:'', COALESCE(:p_root_cause, ''Unknown''),
+        ''. Parts:'', :parts_info, ''. Repair:$'', :avg_cost::VARCHAR, '' FailureCost:$'', :fail_cost::VARCHAR,
+        ''. Reply JSON only no markdown: {""action"":""x"",""priority"":""EMERGENCY"",""parts_needed"":[""x""],""parts_available"":true,""optimal_window"":""x"",""estimated_repair_cost"":520,""estimated_failure_cost"":12000,""cost_savings"":""x"",""risk_if_delayed"":""x"",""work_order_summary"":""x""}''
+    );
+
+    SELECT SNOWFLAKE.CORTEX.COMPLETE(''llama3.1-70b'', :prompt) INTO :llm_response;
+    
+    RETURN :llm_response;
+EXCEPTION
+    WHEN OTHER THEN
+        RETURN CONCAT(''ERROR: '', SQLERRM);
+END;
+';
+CREATE OR REPLACE PROCEDURE "REFRESH_FATIGUE_SCORES"()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+DECLARE
+    v_count NUMBER DEFAULT 0;
+BEGIN
+    INSERT INTO MFGPULSE_DB.ML_MODELS.FATIGUE_SCORES (ASSET_ID, TIMESTAMP, FATIGUE_SCORE, FATIGUE_LEVEL)
+    SELECT
+        rs.ASSET_ID, rs.TIMESTAMP,
+        MFGPULSE_DB.ML_MODELS.COMPUTE_FATIGUE_SCORE(
+            rs.VIB_CREST_FACTOR_6H, rs.VIB_COEFF_VAR_6H, rs.VIB_PEAK_TO_PEAK_6H,
+            rs.VIB_RATE_OF_CHANGE_1H, rs.VIB_ACCELERATION_1H,
+            COALESCE(pc.ENERGY_BALANCE_RATIO, 1.0), COALESCE(pc.STRESS_INDEX, 0.0),
+            COALESCE(si.VIB_XY_CORRELATION_DAILY, 0.3), COALESCE(si.ACOUSTIC_VIB_RATIO, 25.0)
+        ) AS FATIGUE_SCORE,
+        CASE
+            WHEN MFGPULSE_DB.ML_MODELS.COMPUTE_FATIGUE_SCORE(
+                rs.VIB_CREST_FACTOR_6H, rs.VIB_COEFF_VAR_6H, rs.VIB_PEAK_TO_PEAK_6H,
+                rs.VIB_RATE_OF_CHANGE_1H, rs.VIB_ACCELERATION_1H,
+                COALESCE(pc.ENERGY_BALANCE_RATIO, 1.0), COALESCE(pc.STRESS_INDEX, 0.0),
+                COALESCE(si.VIB_XY_CORRELATION_DAILY, 0.3), COALESCE(si.ACOUSTIC_VIB_RATIO, 25.0)
+            ) > 0.7 THEN ''CRITICAL''
+            WHEN MFGPULSE_DB.ML_MODELS.COMPUTE_FATIGUE_SCORE(
+                rs.VIB_CREST_FACTOR_6H, rs.VIB_COEFF_VAR_6H, rs.VIB_PEAK_TO_PEAK_6H,
+                rs.VIB_RATE_OF_CHANGE_1H, rs.VIB_ACCELERATION_1H,
+                COALESCE(pc.ENERGY_BALANCE_RATIO, 1.0), COALESCE(pc.STRESS_INDEX, 0.0),
+                COALESCE(si.VIB_XY_CORRELATION_DAILY, 0.3), COALESCE(si.ACOUSTIC_VIB_RATIO, 25.0)
+            ) > 0.4 THEN ''HIGH''
+            WHEN MFGPULSE_DB.ML_MODELS.COMPUTE_FATIGUE_SCORE(
+                rs.VIB_CREST_FACTOR_6H, rs.VIB_COEFF_VAR_6H, rs.VIB_PEAK_TO_PEAK_6H,
+                rs.VIB_RATE_OF_CHANGE_1H, rs.VIB_ACCELERATION_1H,
+                COALESCE(pc.ENERGY_BALANCE_RATIO, 1.0), COALESCE(pc.STRESS_INDEX, 0.0),
+                COALESCE(si.VIB_XY_CORRELATION_DAILY, 0.3), COALESCE(si.ACOUSTIC_VIB_RATIO, 25.0)
+            ) > 0.2 THEN ''ACCUMULATING''
+            ELSE ''HEALTHY''
+        END AS FATIGUE_LEVEL
+    FROM MFGPULSE_DB.ML_FEATURES.ROLLING_STATS rs
+    LEFT JOIN MFGPULSE_DB.ML_FEATURES.PHYSICS_COMPOSITE pc
+        ON rs.ASSET_ID = pc.ASSET_ID AND rs.TIMESTAMP = pc.TIMESTAMP
+    LEFT JOIN MFGPULSE_DB.ML_FEATURES.SENSOR_INTERACTIONS si
+        ON rs.ASSET_ID = si.ASSET_ID AND rs.TIMESTAMP = si.TIMESTAMP
+    WHERE rs.TIMESTAMP > (SELECT COALESCE(MAX(TIMESTAMP), ''2000-01-01'') FROM MFGPULSE_DB.ML_MODELS.FATIGUE_SCORES)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY rs.ASSET_ID ORDER BY rs.TIMESTAMP DESC) <= 48;
+    SELECT COUNT(*) INTO :v_count FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    RETURN ''Fatigue scores refreshed: '' || :v_count || '' rows at '' || CURRENT_TIMESTAMP()::VARCHAR;
+END;
+';
+CREATE OR REPLACE PROCEDURE "RETRAIN_IF_NEEDED"()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS 'BEGIN
+    LET fm_agreement FLOAT := 100.0;
+    LET stage_agreement FLOAT := 100.0;
+    LET retrained VARCHAR := '''';
+
+    -- Check latest drift metrics (most recent comparison date)
+    SELECT fm_agreement_pct, stage_agreement_pct
+    INTO :fm_agreement, :stage_agreement
+    FROM MFGPULSE_DB.ML_MODELS.DRIFT_METRICS
+    ORDER BY comparison_date DESC
+    LIMIT 1;
+
+    -- Retrain failure mode classifier if agreement < 80%
+    IF (:fm_agreement < 80.0) THEN
+        CREATE OR REPLACE SNOWFLAKE.ML.CLASSIFICATION
+            MFGPULSE_DB.ML_MODELS.NATIVE_FAILURE_MODE_CLASSIFIER(
+                INPUT_DATA => SYSTEM$REFERENCE(''VIEW'', ''MFGPULSE_DB.ML_FEATURES.TRAIN_FAILURE_MODE''),
+                TARGET_COLNAME => ''FAILURE_MODE''
+            );
+        retrained := ''NATIVE_FAILURE_MODE_CLASSIFIER (fm_agreement='' || :fm_agreement || ''%)'';
+    END IF;
+
+    -- Retrain degradation stager if stage agreement < 80%
+    IF (:stage_agreement < 80.0) THEN
+        CREATE OR REPLACE SNOWFLAKE.ML.CLASSIFICATION
+            MFGPULSE_DB.ML_MODELS.NATIVE_DEGRADATION_STAGER(
+                INPUT_DATA => SYSTEM$REFERENCE(''VIEW'', ''MFGPULSE_DB.ML_FEATURES.TRAIN_TRAJECTORY_3CLASS''),
+                TARGET_COLNAME => ''STAGE_3CLASS''
+            );
+        IF (LENGTH(:retrained) > 0) THEN
+            retrained := :retrained || '', '';
+        END IF;
+        retrained := :retrained || ''NATIVE_DEGRADATION_STAGER (stage_agreement='' || :stage_agreement || ''%)'';
+    END IF;
+
+    IF (LENGTH(:retrained) = 0) THEN
+        RETURN ''No retraining needed. FM agreement: '' || :fm_agreement || ''%, Stage agreement: '' || :stage_agreement || ''%'';
+    END IF;
+
+    -- Update model registry
+    UPDATE MFGPULSE_DB.ML_MODELS.MODEL_REGISTRY
+    SET TRAINED_AT = CURRENT_TIMESTAMP()
+    WHERE MODEL_NAME IN (''N1_FAILURE_MODE_NATIVE'', ''N2_DEGRADATION_STAGER_NATIVE'')
+      AND :retrained ILIKE ''%'' || MODEL_NAME || ''%'';
+
+    RETURN ''Retrained: '' || :retrained;
+END';
+CREATE OR REPLACE FUNCTION "SIMULATE_FAILURE_TWIN"("CURRENT_VIB_MAG" FLOAT, "DEGRADATION_VELOCITY" FLOAT, "CURRENT_FATIGUE_SCORE" FLOAT, "LOAD_REDUCTION_PCT" FLOAT, "MAINTENANCE_DELAY_DAYS" FLOAT, "RPM_ADJUSTMENT_PCT" FLOAT)
+RETURNS OBJECT
+LANGUAGE SQL
+AS '
+    -- Monte Carlo simulation: 100 stochastic projections with noise
+    WITH params AS (
+        SELECT 
+            GREATEST(0.001, COALESCE(degradation_velocity, 0.1)) 
+                * (1.0 - load_reduction_pct / 100.0 * 0.6) 
+                * (1.0 + rpm_adjustment_pct / 100.0 * 0.3) AS adj_rate,
+            current_fatigue_score AS base_fatigue,
+            maintenance_delay_days AS delay_days
+    ),
+    simulations AS (
+        SELECT 
+            seq4() AS sim_id,
+            -- Stochastic degradation rate: base rate * random multiplier (0.5x to 2.0x)
+            p.adj_rate * (0.5 + UNIFORM(0::FLOAT, 1.5::FLOAT, RANDOM())) AS sim_rate,
+            -- Random shock events (5% chance per day of acceleration event)
+            UNIFORM(0::FLOAT, 1::FLOAT, RANDOM()) AS shock_rnd
+        FROM TABLE(GENERATOR(ROWCOUNT => 100))
+        CROSS JOIN params p
+    ),
+    projections AS (
+        SELECT 
+            s.sim_id,
+            -- Day 3 fatigue
+            LEAST(1.0, p.base_fatigue + s.sim_rate * 3 + CASE WHEN s.shock_rnd < 0.15 THEN 0.1 ELSE 0 END) AS fatigue_day3,
+            -- Day 7 fatigue
+            LEAST(1.0, p.base_fatigue + s.sim_rate * 7 + CASE WHEN s.shock_rnd < 0.35 THEN 0.15 ELSE 0 END) AS fatigue_day7,
+            -- Day 14 fatigue
+            LEAST(1.0, p.base_fatigue + s.sim_rate * 14 + CASE WHEN s.shock_rnd < 0.50 THEN 0.2 ELSE 0 END) AS fatigue_day14,
+            -- Estimated failure day (when fatigue reaches 1.0)
+            CASE WHEN s.sim_rate > 0 
+                THEN (1.0 - p.base_fatigue) / s.sim_rate 
+                ELSE 999 
+            END AS days_to_failure,
+            -- Apply maintenance delay: if fixed before failure, fatigue resets
+            CASE WHEN p.delay_days < (1.0 - p.base_fatigue) / NULLIF(s.sim_rate, 0)
+                THEN 0  -- maintenance happens before failure
+                ELSE 1  -- failure happens before maintenance
+            END AS fails_before_maintenance
+        FROM simulations s
+        CROSS JOIN params p
+    )
+    SELECT OBJECT_CONSTRUCT(
+        ''scenario'', OBJECT_CONSTRUCT(
+            ''load_reduction_pct'', load_reduction_pct,
+            ''maintenance_delay_days'', maintenance_delay_days,
+            ''rpm_adjustment_pct'', rpm_adjustment_pct
+        ),
+        ''num_simulations'', 100,
+        -- Failure probability = % of simulations that exceed threshold
+        ''failure_prob_day_3'', ROUND((SELECT COUNT(*) FROM projections WHERE fatigue_day3 > 0.9) / 100.0, 3),
+        ''failure_prob_day_7'', ROUND((SELECT COUNT(*) FROM projections WHERE fatigue_day7 > 0.9) / 100.0, 3),
+        ''failure_prob_day_14'', ROUND((SELECT COUNT(*) FROM projections WHERE fatigue_day14 > 0.9) / 100.0, 3),
+        -- RUL distribution (percentiles)
+        ''rul_days_p10'', ROUND((SELECT PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY days_to_failure) FROM projections), 1),
+        ''rul_days_p50'', ROUND((SELECT PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY days_to_failure) FROM projections), 1),
+        ''rul_days_p90'', ROUND((SELECT PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY days_to_failure) FROM projections), 1),
+        -- Risk of failure before maintenance arrives
+        ''fails_before_maintenance_pct'', ROUND((SELECT SUM(fails_before_maintenance) FROM projections) / 100.0 * 100, 1),
+        -- Recommended intervention
+        ''recommended_intervention'', CASE
+            WHEN current_fatigue_score > 0.8 THEN ''IMMEDIATE - within 24 hours''
+            WHEN current_fatigue_score > 0.6 THEN ''URGENT - within 3 days''
+            WHEN current_fatigue_score > 0.4 THEN ''PLANNED - within 7 days''
+            ELSE ''MONITOR - next scheduled PM''
+        END,
+        -- Cost analysis
+        ''cost_of_repair_now'', 520,
+        ''cost_of_failure'', 12000,
+        ''expected_cost'', ROUND(520 + 12000 * (SELECT COUNT(*) FROM projections WHERE fatigue_day14 > 0.9) / 100.0, 0)
+    )
+';
+create or replace cortex search service MAINTENANCE_SEARCH
+	ON SEARCH_TEXT
+	attributes ASSET_ID,WO_TYPE
+	warehouse='COMPUTE_WH'
+	target_lag='1 day'
+	refresh_mode=INCREMENTAL
+	as (
+        SELECT
+            ml.LOG_ID AS doc_id,
+            ml.ASSET_ID,
+            wo.WO_TYPE,
+            CONCAT(
+                'Asset: ', am.ASSET_NAME, ' (', ml.ASSET_ID, '). ',
+                'Work order: ', ml.WO_ID, ' [', wo.WO_TYPE, ', ', wo.PRIORITY, ']. ',
+                'Date: ', ml.TIMESTAMP::VARCHAR, '. ',
+                'Technician: ', ml.TECHNICIAN, '. ',
+                'Notes: ', ml.NOTES_TEXT
+            ) AS search_text
+        FROM MFGPULSE_DB.RAW_IT.MAINTENANCE_LOGS ml
+        JOIN MFGPULSE_DB.RAW_OT.ASSET_MASTER am ON ml.ASSET_ID = am.ASSET_ID
+        LEFT JOIN MFGPULSE_DB.RAW_IT.WORK_ORDERS wo ON ml.WO_ID = wo.WO_ID
+    );
+create or replace schema PUBLIC;
+
+create or replace TABLE DEPLOYMENT_LOG (
+	CHECKPOINT_ID NUMBER(38,0),
+	CHECKPOINT_NAME VARCHAR(100),
+	STARTED_AT TIMESTAMP_NTZ(9),
+	COMPLETED_AT TIMESTAMP_NTZ(9),
+	DURATION_SEC FLOAT,
+	OBJECTS_CREATED NUMBER(38,0),
+	VALIDATION VARCHAR(20),
+	DETAILS VARCHAR(2000)
+);
+create or replace schema RAW_IT;
+
+create or replace TABLE APP_NOTIFICATIONS (
+	NOTIF_ID VARCHAR(200),
+	EVENT_TYPE VARCHAR(50),
+	PERSONA_TARGET VARCHAR(50),
+	TITLE VARCHAR(500),
+	MESSAGE VARCHAR(2000),
+	ENTITY_ID VARCHAR(100),
+	PRIORITY VARCHAR(20) DEFAULT 'NORMAL',
+	IS_READ BOOLEAN DEFAULT FALSE,
+	DISMISSED BOOLEAN DEFAULT FALSE,
+	CREATED_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP()
+);
+create or replace TABLE MAINTENANCE_LOGS (
+	LOG_ID VARCHAR(20) NOT NULL,
+	WO_ID VARCHAR(20),
+	ASSET_ID VARCHAR(20) NOT NULL,
+	TIMESTAMP TIMESTAMP_NTZ(9) NOT NULL,
+	TECHNICIAN VARCHAR(100),
+	NOTES_TEXT VARCHAR(2000),
+	primary key (LOG_ID)
+);
+create or replace TABLE NOTIFICATION_SETTINGS (
+	EVENT_TYPE VARCHAR(50) NOT NULL,
+	EVENT_LABEL VARCHAR(200),
+	EMAIL_ENABLED BOOLEAN DEFAULT FALSE,
+	IN_APP_ENABLED BOOLEAN DEFAULT TRUE,
+	EMAIL_RECIPIENTS VARCHAR(1000) DEFAULT '',
+	NOTIFY_PERSONAS VARCHAR(500),
+	PRIORITY VARCHAR(20) DEFAULT 'NORMAL',
+	primary key (EVENT_TYPE)
+);
+create or replace TABLE PARTS_INVENTORY (
+	PART_ID VARCHAR(20) NOT NULL,
+	PART_NAME VARCHAR(200) NOT NULL,
+	COMPATIBLE_ASSETS ARRAY,
+	QUANTITY_ON_HAND NUMBER(38,0),
+	LEAD_TIME_DAYS NUMBER(38,0),
+	UNIT_COST FLOAT,
+	primary key (PART_ID)
+);
+create or replace TABLE PART_RESERVATIONS (
+	RESERVATION_ID VARCHAR(50) NOT NULL,
+	PART_ID VARCHAR(20) NOT NULL,
+	ASSET_ID VARCHAR(20) NOT NULL,
+	WO_ID VARCHAR(50),
+	QUANTITY_RESERVED NUMBER(38,0) DEFAULT 1,
+	REQUIRED_BY_DATE DATE,
+	STATUS VARCHAR(20) DEFAULT 'active',
+	CREATED_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+	primary key (RESERVATION_ID)
+);
+create or replace TABLE PART_SUPPLIERS (
+	PART_ID VARCHAR(20) NOT NULL,
+	SUPPLIER_ID VARCHAR(20) NOT NULL,
+	SUPPLIER_PART_NUMBER VARCHAR(50),
+	STANDARD_LEAD_TIME_DAYS NUMBER(38,0) DEFAULT 7,
+	EXPEDITE_LEAD_TIME_DAYS NUMBER(38,0) DEFAULT 3,
+	MIN_ORDER_QTY NUMBER(38,0) DEFAULT 1,
+	UNIT_COST FLOAT,
+	PREFERRED_SUPPLIER BOOLEAN DEFAULT FALSE
+);
+create or replace TABLE PRODUCTION_OUTPUT (
+	RECORD_ID VARCHAR(20) NOT NULL,
+	ASSET_ID VARCHAR(20) NOT NULL,
+	SHIFT_ID VARCHAR(20),
+	TIMESTAMP TIMESTAMP_NTZ(9) NOT NULL,
+	UNITS_PRODUCED NUMBER(38,0),
+	GOOD_UNITS NUMBER(38,0),
+	IDEAL_CYCLE_TIME_SEC FLOAT,
+	primary key (RECORD_ID)
+);
+create or replace TABLE PURCHASE_ORDERS (
+	PO_ID VARCHAR(50) NOT NULL,
+	SUPPLIER_ID VARCHAR(20),
+	CREATED_DATE TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+	REQUIRED_BY_DATE DATE,
+	EXPECTED_ARRIVAL_DATE DATE,
+	STATUS VARCHAR(30) DEFAULT 'draft',
+	PRIORITY VARCHAR(20) DEFAULT 'NORMAL',
+	TOTAL_COST FLOAT,
+	CREATED_BY VARCHAR(100) DEFAULT 'SYSTEM',
+	SOURCE VARCHAR(30) DEFAULT 'prediction',
+	REJECTION_REASON VARCHAR(16777216),
+	REJECTED_BY VARCHAR(16777216),
+	REJECTED_AT TIMESTAMP_NTZ(9),
+	primary key (PO_ID)
+);
+create or replace TABLE PURCHASE_ORDER_LINES (
+	PO_LINE_ID VARCHAR(50) NOT NULL,
+	PO_ID VARCHAR(50) NOT NULL,
+	PART_ID VARCHAR(20) NOT NULL,
+	ASSET_ID VARCHAR(20),
+	WO_ID VARCHAR(50),
+	QUANTITY_ORDERED NUMBER(38,0) DEFAULT 1,
+	UNIT_COST FLOAT,
+	LINE_COST FLOAT,
+	RUL_HOURS_AT_ORDER FLOAT,
+	FAILURE_MODE_PRED VARCHAR(50),
+	PROCUREMENT_RISK VARCHAR(30),
+	primary key (PO_LINE_ID)
+);
+create or replace TABLE SHIFT_SCHEDULE (
+	SHIFT_ID VARCHAR(20) NOT NULL,
+	LINE_ID VARCHAR(20) NOT NULL,
+	SHIFT_START TIMESTAMP_NTZ(9) NOT NULL,
+	SHIFT_END TIMESTAMP_NTZ(9) NOT NULL,
+	OPERATOR_NAME VARCHAR(100),
+	PLANNED_PRODUCTION_TIME_MINS NUMBER(38,0),
+	primary key (SHIFT_ID)
+);
+create or replace TABLE SIMULATION_CONFIG (
+	CONFIG_ID NUMBER(38,0) NOT NULL autoincrement start 1 increment 1 noorder,
+	ASSET_ID VARCHAR(50),
+	SCENARIO VARCHAR(50),
+	SEVERITY FLOAT,
+	HOURS NUMBER(38,0),
+	STATUS VARCHAR(20),
+	ROWS_GENERATED NUMBER(38,0),
+	ESTIMATED_CREDITS FLOAT,
+	CREATED_BY VARCHAR(100),
+	CREATED_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+	COMPLETED_AT TIMESTAMP_NTZ(9),
+	primary key (CONFIG_ID)
+);
+create or replace TABLE SUPPLIERS (
+	SUPPLIER_ID VARCHAR(20) NOT NULL,
+	SUPPLIER_NAME VARCHAR(200) NOT NULL,
+	CONTACT_EMAIL VARCHAR(200),
+	PHONE VARCHAR(50),
+	ACTIVE BOOLEAN DEFAULT TRUE,
+	CREATED_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+	primary key (SUPPLIER_ID)
+);
+create or replace TABLE USERS (
+	USER_ID VARCHAR(20) NOT NULL,
+	USERNAME VARCHAR(100) NOT NULL,
+	EMAIL VARCHAR(200),
+	PERSONA VARCHAR(50) NOT NULL,
+	ROLE VARCHAR(50),
+	LINE_ID VARCHAR(20),
+	ACTIVE BOOLEAN DEFAULT TRUE,
+	CREATED_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+	primary key (USER_ID)
+);
+create or replace TABLE WORK_ORDERS (
+	WO_ID VARCHAR(50) NOT NULL,
+	ASSET_ID VARCHAR(20) NOT NULL,
+	WO_TYPE VARCHAR(20) NOT NULL,
+	CREATED_DATE TIMESTAMP_NTZ(9) NOT NULL,
+	COMPLETED_DATE TIMESTAMP_NTZ(9),
+	PRIORITY VARCHAR(10),
+	STATUS VARCHAR(20),
+	ASSIGNED_TO VARCHAR(100),
+	LABOR_HOURS FLOAT,
+	PARTS_COST FLOAT,
+	TOTAL_COST FLOAT,
+	ROOT_CAUSE_CONFIRMED VARCHAR(16777216),
+	PART_USED BOOLEAN DEFAULT TRUE,
+	primary key (WO_ID)
+);
+CREATE OR REPLACE PROCEDURE "LOG_APP_NOTIFICATION"("P_EVENT_TYPE" VARCHAR, "P_TITLE" VARCHAR, "P_MESSAGE" VARCHAR, "P_ENTITY_ID" VARCHAR)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+DECLARE
+    v_email_enabled BOOLEAN DEFAULT FALSE;
+    v_in_app_enabled BOOLEAN DEFAULT TRUE;
+    v_recipients VARCHAR DEFAULT '''';
+    v_personas VARCHAR DEFAULT '''';
+    v_priority VARCHAR DEFAULT ''NORMAL'';
+    v_notif_count NUMBER DEFAULT 0;
+    v_email_result VARCHAR DEFAULT ''SKIPPED'';
+BEGIN
+    -- Read settings for this event type
+    BEGIN
+        SELECT EMAIL_ENABLED, IN_APP_ENABLED, EMAIL_RECIPIENTS, NOTIFY_PERSONAS, PRIORITY
+        INTO :v_email_enabled, :v_in_app_enabled, :v_recipients, :v_personas, :v_priority
+        FROM MFGPULSE_DB.RAW_IT.NOTIFICATION_SETTINGS
+        WHERE EVENT_TYPE = :p_event_type;
+    EXCEPTION
+        WHEN OTHER THEN
+            v_in_app_enabled := TRUE;
+            v_personas := ''PLANT_MANAGER,APP_ADMIN'';
+    END;
+
+    -- In-app notifications: one per target persona
+    IF (:v_in_app_enabled) THEN
+        INSERT INTO MFGPULSE_DB.RAW_IT.APP_NOTIFICATIONS
+            (NOTIF_ID, EVENT_TYPE, PERSONA_TARGET, TITLE, MESSAGE, ENTITY_ID, PRIORITY)
+        SELECT
+            :p_event_type || ''-'' || value || ''-'' || TO_CHAR(CURRENT_TIMESTAMP(), ''YYYYMMDD_HH24MISS''),
+            :p_event_type,
+            TRIM(value),
+            :p_title,
+            :p_message,
+            :p_entity_id,
+            :v_priority
+        FROM TABLE(SPLIT_TO_TABLE(:v_personas, '',''));
+
+        SELECT COUNT(*) INTO :v_notif_count
+        FROM MFGPULSE_DB.RAW_IT.APP_NOTIFICATIONS
+        WHERE ENTITY_ID = :p_entity_id AND EVENT_TYPE = :p_event_type;
+    END IF;
+
+    -- Email notification
+    IF (:v_email_enabled AND LENGTH(TRIM(:v_recipients)) > 0) THEN
+        LET email_subject VARCHAR := ''MFGPulse '' || :v_priority || '': '' || :p_title;
+        LET email_body VARCHAR := ''<div style="font-family:sans-serif;"><h3>'' || :p_title || ''</h3><p>'' || :p_message || ''</p><p style="color:#666;font-size:12px;">Entity: '' || COALESCE(:p_entity_id, ''N/A'') || '' | '' || CURRENT_TIMESTAMP()::VARCHAR || ''</p></div>'';
+        CALL MFGPULSE_DB.RAW_IT.SEND_MFGPULSE_EMAIL(:email_subject, :email_body, :v_recipients);
+        SELECT * INTO :v_email_result FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    END IF;
+
+    RETURN OBJECT_CONSTRUCT(
+        ''status'', ''OK'',
+        ''event_type'', :p_event_type,
+        ''in_app_sent'', :v_notif_count,
+        ''email_result'', :v_email_result
+    );
+END;
+';
+CREATE OR REPLACE PROCEDURE "SEND_MFGPULSE_EMAIL"("P_SUBJECT" VARCHAR, "P_BODY_HTML" VARCHAR, "P_RECIPIENTS" VARCHAR)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+BEGIN
+    IF (:p_recipients IS NULL OR LENGTH(TRIM(:p_recipients)) = 0) THEN
+        RETURN ''SKIPPED: No recipients'';
+    END IF;
+    BEGIN
+        CALL SYSTEM$SEND_SNOWFLAKE_NOTIFICATION(
+            SNOWFLAKE.NOTIFICATION.TEXT_HTML(:p_body_html),
+            SNOWFLAKE.NOTIFICATION.EMAIL_INTEGRATION_CONFIG(
+                ''MFGPULSE_EMAIL'',
+                :p_subject,
+                SPLIT(:p_recipients, '','')
+            )
+        );
+        RETURN ''SENT'';
+    EXCEPTION
+        WHEN OTHER THEN RETURN ''EMAIL_ERROR: '' || SQLERRM;
+    END;
+END;
+';
+create or replace stream MAINTENANCE_LOGS_STREAM on table MAINTENANCE_LOGS append_only = true;
+create or replace stream WORK_ORDERS_STREAM on table WORK_ORDERS;
+create or replace schema RAW_OT;
+
+create or replace TABLE AMBIENT_CONDITIONS (
+	READING_DATE DATE NOT NULL,
+	AMBIENT_TEMP_C FLOAT,
+	HUMIDITY_PCT FLOAT,
+	BAROMETRIC_PRESSURE_HPA FLOAT
+);
+create or replace TABLE ASSET_MASTER (
+	ASSET_ID VARCHAR(20) NOT NULL,
+	ASSET_NAME VARCHAR(100) NOT NULL,
+	ASSET_TYPE VARCHAR(50) NOT NULL,
+	LINE_ID VARCHAR(20) NOT NULL,
+	INSTALL_DATE DATE,
+	MANUFACTURER VARCHAR(100),
+	MODEL_NUMBER VARCHAR(50),
+	RATED_RPM FLOAT,
+	RATED_TEMP_MAX FLOAT,
+	primary key (ASSET_ID)
+);
+create or replace TABLE SENSOR_METADATA (
+	SENSOR_ID VARCHAR(30) NOT NULL,
+	ASSET_ID VARCHAR(20) NOT NULL,
+	SENSOR_TYPE VARCHAR(50) NOT NULL,
+	LOCATION VARCHAR(100),
+	CALIBRATION_DATE DATE,
+	SAMPLING_RATE_HZ FLOAT,
+	primary key (SENSOR_ID)
+);
+create or replace TABLE SENSOR_READINGS (
+	READING_ID NUMBER(38,0) autoincrement start 1 increment 1 noorder,
+	ASSET_ID VARCHAR(20) NOT NULL,
+	TIMESTAMP TIMESTAMP_NTZ(9) NOT NULL,
+	VIBRATION_X FLOAT,
+	VIBRATION_Y FLOAT,
+	VIBRATION_Z FLOAT,
+	TEMPERATURE FLOAT,
+	RPM FLOAT,
+	PRESSURE FLOAT,
+	CURRENT_AMPS FLOAT,
+	ACOUSTIC_DB FLOAT,
+	INGESTION_TS TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP()
+);
+CREATE OR REPLACE PROCEDURE "GENERATE_SENSOR_DATA"()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+DECLARE
+    start_date DATE := ''2026-03-01'';
+    end_date DATE := ''2026-08-28'';
+    row_count INTEGER := 0;
+BEGIN
+    INSERT INTO MFGPULSE_DB.RAW_OT.SENSOR_READINGS 
+        (asset_id, timestamp, vibration_x, vibration_y, vibration_z, temperature, rpm, pressure, current_amps, acoustic_db)
+    WITH time_series AS (
+        SELECT DATEADD(''minute'', seq4() * 15, :start_date::TIMESTAMP_NTZ) AS ts
+        FROM TABLE(GENERATOR(ROWCOUNT => 17280))
+    ),
+    assets AS (
+        SELECT asset_id, rated_rpm, rated_temp_max,
+            CASE asset_id
+                WHEN ''ASSET_001'' THEN ''bearing_wear'' WHEN ''ASSET_002'' THEN ''thermal_degradation''
+                WHEN ''ASSET_003'' THEN ''imbalance'' WHEN ''ASSET_004'' THEN ''misalignment''
+                WHEN ''ASSET_005'' THEN ''bearing_wear'' WHEN ''ASSET_006'' THEN ''thermal_degradation''
+                WHEN ''ASSET_007'' THEN ''healthy'' WHEN ''ASSET_008'' THEN ''imbalance''
+                WHEN ''ASSET_009'' THEN ''misalignment'' WHEN ''ASSET_010'' THEN ''healthy''
+            END AS failure_mode,
+            CASE asset_id
+                WHEN ''ASSET_001'' THEN 0.55 WHEN ''ASSET_002'' THEN 0.60 WHEN ''ASSET_003'' THEN 0.50
+                WHEN ''ASSET_004'' THEN 0.45 WHEN ''ASSET_005'' THEN 0.65 WHEN ''ASSET_006'' THEN 0.70
+                WHEN ''ASSET_007'' THEN 0.99 WHEN ''ASSET_008'' THEN 0.75 WHEN ''ASSET_009'' THEN 0.40
+                WHEN ''ASSET_010'' THEN 0.99
+            END AS failure_start_pct
+        FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER
+    ),
+    combined AS (
+        SELECT a.asset_id, t.ts, a.rated_rpm, a.rated_temp_max, a.failure_mode, a.failure_start_pct,
+            DATEDIFF(''minute'', :start_date::TIMESTAMP_NTZ, t.ts) /
+                DATEDIFF(''minute'', :start_date::TIMESTAMP_NTZ, :end_date::TIMESTAMP_NTZ)::FLOAT AS timeline_pct,
+            GREATEST(0, (DATEDIFF(''minute'', :start_date::TIMESTAMP_NTZ, t.ts) /
+                DATEDIFF(''minute'', :start_date::TIMESTAMP_NTZ, :end_date::TIMESTAMP_NTZ)::FLOAT
+                - a.failure_start_pct) / NULLIF(1 - a.failure_start_pct, 0)
+            ) AS degradation_pct,
+            UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS noise1,
+            UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS noise2,
+            UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS noise3,
+            UNIFORM(0::FLOAT, 1::FLOAT, RANDOM()) AS missing_rnd,
+            SIN(DATEDIFF(''hour'', :start_date::TIMESTAMP_NTZ, t.ts) / 500.0) * 0.3 AS sensor_drift
+        FROM time_series t CROSS JOIN assets a
+    )
+    SELECT asset_id, ts,
+        CASE WHEN missing_rnd < 0.002 THEN NULL
+            WHEN failure_mode = ''bearing_wear'' THEN 2.0 + noise1*0.5 + sensor_drift + degradation_pct*8.0*(1+degradation_pct) + CASE WHEN degradation_pct > 0.8 THEN ABS(noise2)*15.0 ELSE 0 END
+            WHEN failure_mode = ''misalignment'' THEN 2.5 + noise1*0.4 + sensor_drift + degradation_pct*5.0 + degradation_pct*SIN(timeline_pct*200)*3.0
+            WHEN failure_mode = ''imbalance'' THEN 1.8 + noise1*0.3 + sensor_drift + degradation_pct*2.0
+            ELSE 1.5 + noise1*0.4 + sensor_drift END,
+        CASE WHEN missing_rnd < 0.002 THEN NULL
+            WHEN failure_mode = ''bearing_wear'' THEN 1.8 + noise2*0.4 + degradation_pct*6.0*(1+degradation_pct*0.5)
+            WHEN failure_mode = ''misalignment'' THEN 2.2 + noise2*0.5 + degradation_pct*6.5 + degradation_pct*COS(timeline_pct*200)*2.5
+            WHEN failure_mode = ''imbalance'' THEN 1.5 + noise2*0.3 + degradation_pct*7.0*(1+degradation_pct)
+            ELSE 1.3 + noise2*0.35 END,
+        CASE WHEN missing_rnd < 0.002 THEN NULL
+            WHEN failure_mode = ''bearing_wear'' THEN 1.5 + noise3*0.3 + degradation_pct*4.0
+            WHEN failure_mode = ''misalignment'' THEN 2.0 + noise3*0.5 + degradation_pct*5.5
+            WHEN failure_mode = ''imbalance'' THEN 1.2 + noise3*0.25 + degradation_pct*1.5
+            ELSE 1.1 + noise3*0.3 END,
+        CASE WHEN missing_rnd < 0.001 THEN NULL
+            WHEN failure_mode = ''thermal_degradation'' THEN rated_temp_max*0.55 + noise1*2.0 + degradation_pct*rated_temp_max*0.40*(1+degradation_pct*0.3) + SIN(timeline_pct*48)*3.0
+            WHEN failure_mode = ''bearing_wear'' THEN rated_temp_max*0.50 + noise1*1.5 + degradation_pct*rated_temp_max*0.15
+            ELSE rated_temp_max*0.50 + noise1*2.0 + SIN(timeline_pct*48)*2.5 END,
+        CASE WHEN failure_mode = ''imbalance'' THEN rated_rpm*(1.0 + noise1*0.005 - degradation_pct*0.08)
+            ELSE rated_rpm*(1.0 + noise1*0.003) END,
+        CASE WHEN failure_mode = ''bearing_wear'' THEN 6.5+noise2*0.2+degradation_pct*1.5 ELSE 6.0+noise2*0.2 END,
+        CASE WHEN failure_mode = ''misalignment'' THEN 12.0 + noise3*0.5 + degradation_pct*8.0*(1+degradation_pct)
+            WHEN failure_mode = ''bearing_wear'' THEN 11.5 + noise3*0.4 + degradation_pct*3.0
+            ELSE 10.5 + noise3*0.4 END,
+        CASE WHEN failure_mode = ''bearing_wear'' THEN 72 + noise1*2.0 + degradation_pct*18.0 + CASE WHEN degradation_pct > 0.7 THEN ABS(noise2)*8.0 ELSE 0 END
+            WHEN failure_mode = ''misalignment'' THEN 70 + noise1*1.5 + degradation_pct*12.0
+            ELSE 65 + noise1*2.0 END
+    FROM combined WHERE missing_rnd > 0.003;
+    SELECT COUNT(*) INTO :row_count FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS;
+    RETURN ''Generated '' || :row_count || '' sensor readings'';
+END;
+';
+CREATE OR REPLACE PROCEDURE "SIMULATE_ALL_FEEDS_RANDOM"()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+DECLARE
+    v_result VARCHAR;
+    v_total_rows NUMBER DEFAULT 0;
+    c_asset_id VARCHAR; c_line_id VARCHAR; c_current_deg FLOAT;
+    c_has_recent_wo BOOLEAN; c_scenario VARCHAR; c_severity FLOAT;
+    asset_cursor CURSOR FOR
+        SELECT
+            am.ASSET_ID, am.LINE_ID,
+            COALESCE(lp.DEGRADATION_SCORE, 0.1) AS CURRENT_DEG,
+            CASE WHEN EXISTS (
+                SELECT 1 FROM MFGPULSE_DB.RAW_IT.WORK_ORDERS wo
+                WHERE wo.ASSET_ID = am.ASSET_ID AND wo.STATUS = ''completed''
+                  AND wo.COMPLETED_DATE >= DATEADD(''hour'', -13, CURRENT_TIMESTAMP())
+            ) THEN TRUE ELSE FALSE END AS HAS_RECENT_WO
+        FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER am
+        LEFT JOIN MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS lp ON am.ASSET_ID = lp.ASSET_ID;
+BEGIN
+    OPEN asset_cursor;
+    FOR rec IN asset_cursor DO
+        c_asset_id := rec.ASSET_ID;
+        c_line_id := rec.LINE_ID;
+        c_current_deg := rec.CURRENT_DEG;
+        c_has_recent_wo := rec.HAS_RECENT_WO;
+        IF (:c_has_recent_wo) THEN
+            c_severity := ROUND(GREATEST(0.10, :c_current_deg * 0.30) + UNIFORM(0.0::FLOAT, 0.05::FLOAT, RANDOM()), 2);
+            c_scenario := ''CLEAN'';
+        ELSE
+            LET delta FLOAT := ROUND(UNIFORM(0.01::FLOAT, 0.06::FLOAT, RANDOM()), 3);
+            c_severity := LEAST(0.95, :c_current_deg + :delta);
+            LET flicker FLOAT := UNIFORM(0::FLOAT, 1::FLOAT, RANDOM());
+            IF (:c_severity > 0.30 AND :flicker < 0.10) THEN
+                c_severity := GREATEST(0.15, :c_severity - UNIFORM(0.10::FLOAT, 0.20::FLOAT, RANDOM()));
+            END IF;
+            IF (:c_severity < 0.30) THEN
+                LET r FLOAT := UNIFORM(0::FLOAT, 1::FLOAT, RANDOM());
+                c_scenario := CASE WHEN :r < 0.80 THEN ''CLEAN'' WHEN :r < 0.90 THEN ''BEARING_WEAR'' ELSE ''IMBALANCE'' END;
+            ELSEIF (:c_severity < 0.60) THEN
+                LET r FLOAT := UNIFORM(0::FLOAT, 1::FLOAT, RANDOM());
+                c_scenario := CASE WHEN :r < 0.20 THEN ''CLEAN'' WHEN :r < 0.50 THEN ''BEARING_WEAR'' WHEN :r < 0.75 THEN ''THERMAL_DEGRADATION'' ELSE ''IMBALANCE'' END;
+            ELSE
+                LET r FLOAT := UNIFORM(0::FLOAT, 1::FLOAT, RANDOM());
+                c_scenario := CASE WHEN :r < 0.30 THEN ''BEARING_WEAR'' WHEN :r < 0.55 THEN ''THERMAL_DEGRADATION'' WHEN :r < 0.80 THEN ''MISALIGNMENT'' ELSE ''IMBALANCE'' END;
+            END IF;
+        END IF;
+        CALL MFGPULSE_DB.RAW_OT.SIMULATE_SENSOR_FEED_CONFIGURABLE(:c_asset_id, :c_scenario, :c_severity, 12);
+        v_total_rows := :v_total_rows + 1;
+    END FOR;
+    CLOSE asset_cursor;
+    BEGIN
+        INSERT INTO MFGPULSE_DB.RAW_IT.SIMULATION_CONFIG
+            (ASSET_ID, SCENARIO, SEVERITY, HOURS, STATUS, ROWS_GENERATED, ESTIMATED_CREDITS, CREATED_AT, CREATED_BY, COMPLETED_AT)
+        VALUES (''ALL_RANDOM'', ''PERSISTENT_DEGRADATION'', 0, 12, ''COMPLETED'', :v_total_rows * 49, 0.15, CURRENT_TIMESTAMP(), ''SIMULATE_ALL_FEEDS_RANDOM'', CURRENT_TIMESTAMP());
+    EXCEPTION WHEN OTHER THEN NULL;
+    END;
+    v_result := ''Completed: '' || :v_total_rows || '' assets simulated with persistent degradation + WO recovery'';
+    RETURN :v_result;
+END;
+';
+CREATE OR REPLACE PROCEDURE "SIMULATE_SENSOR_FEED_CONFIGURABLE"("P_ASSET_ID" VARCHAR, "P_SCENARIO" VARCHAR, "P_SEVERITY" FLOAT, "P_HOURS" NUMBER(38,0))
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+DECLARE
+    v_rows INT := 0;
+    v_readings_per_asset INT;
+    v_scenario VARCHAR;
+BEGIN
+    v_readings_per_asset := :P_HOURS * 4;
+    v_scenario := UPPER(:P_SCENARIO);
+
+    INSERT INTO MFGPULSE_DB.RAW_OT.SENSOR_READINGS
+        (asset_id, timestamp, vibration_x, vibration_y, vibration_z, temperature, rpm, pressure, current_amps, acoustic_db)
+    WITH time_slots AS (
+        SELECT DATEADD(''minute'', seq4() * 15, DATEADD(''hour'', -:P_HOURS, CURRENT_TIMESTAMP())::TIMESTAMP_NTZ) AS ts
+        FROM TABLE(GENERATOR(ROWCOUNT => :v_readings_per_asset))
+    ),
+    target_assets AS (
+        SELECT asset_id, rated_rpm, rated_temp_max
+        FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER
+        WHERE (:P_ASSET_ID = ''ALL'' OR asset_id = :P_ASSET_ID)
+    ),
+    combined AS (
+        SELECT a.asset_id, t.ts, a.rated_rpm, a.rated_temp_max,
+            :v_scenario AS scenario,
+            :P_SEVERITY AS severity,
+            ROW_NUMBER() OVER (PARTITION BY a.asset_id ORDER BY t.ts) / :v_readings_per_asset::FLOAT AS timeline_pct,
+            UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS n1,
+            UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS n2,
+            UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS n3,
+            UNIFORM(0::FLOAT, 1::FLOAT, RANDOM()) AS n4
+        FROM time_slots t CROSS JOIN target_assets a
+    )
+    SELECT
+        asset_id, ts,
+        CASE
+            WHEN scenario = ''CLEAN'' THEN 1.5 + n1*0.3
+            WHEN scenario = ''BEARING_WEAR'' THEN 2.0 + n1*0.5 + severity*8.0*(1+severity) + CASE WHEN severity > 0.8 THEN ABS(n2)*15.0 ELSE 0 END
+            WHEN scenario = ''MISALIGNMENT'' THEN 2.5 + n1*0.4 + severity*5.0 + severity*SIN(timeline_pct*200)*3.0
+            WHEN scenario = ''IMBALANCE'' THEN 1.8 + n1*0.3 + severity*2.0
+            WHEN scenario = ''THERMAL_DEGRADATION'' THEN 1.6 + n1*0.3 + severity*0.5
+            ELSE 1.5 + n1*0.3
+        END,
+        CASE
+            WHEN scenario = ''CLEAN'' THEN 1.3 + n2*0.3
+            WHEN scenario = ''BEARING_WEAR'' THEN 1.8 + n2*0.4 + severity*6.0*(1+severity*0.5)
+            WHEN scenario = ''MISALIGNMENT'' THEN 2.2 + n2*0.5 + severity*6.5 + severity*COS(timeline_pct*200)*2.5
+            WHEN scenario = ''IMBALANCE'' THEN 1.5 + n2*0.3 + severity*7.0*(1+severity)
+            WHEN scenario = ''THERMAL_DEGRADATION'' THEN 1.4 + n2*0.3 + severity*0.4
+            ELSE 1.3 + n2*0.3
+        END,
+        CASE
+            WHEN scenario = ''CLEAN'' THEN 1.1 + n3*0.25
+            WHEN scenario = ''BEARING_WEAR'' THEN 1.5 + n3*0.3 + severity*4.0
+            WHEN scenario = ''MISALIGNMENT'' THEN 2.0 + n3*0.5 + severity*5.5
+            WHEN scenario = ''IMBALANCE'' THEN 1.2 + n3*0.25 + severity*1.5
+            WHEN scenario = ''THERMAL_DEGRADATION'' THEN 1.2 + n3*0.25 + severity*0.3
+            ELSE 1.1 + n3*0.25
+        END,
+        CASE
+            WHEN scenario = ''CLEAN'' THEN rated_temp_max*0.50 + n1*2.0
+            WHEN scenario = ''THERMAL_DEGRADATION'' THEN rated_temp_max*0.55 + n1*2.0 + severity*rated_temp_max*0.40*(1+severity*0.3) + SIN(timeline_pct*48)*3.0
+            WHEN scenario = ''BEARING_WEAR'' THEN rated_temp_max*0.50 + n1*1.5 + severity*rated_temp_max*0.15
+            WHEN scenario = ''MISALIGNMENT'' THEN rated_temp_max*0.52 + n1*1.5 + severity*rated_temp_max*0.08
+            ELSE rated_temp_max*0.50 + n1*2.0
+        END,
+        CASE
+            WHEN scenario = ''IMBALANCE'' THEN rated_rpm*(1.0 + n1*0.005 - severity*0.08)
+            ELSE rated_rpm*(1.0 + n1*0.003)
+        END,
+        CASE
+            WHEN scenario = ''BEARING_WEAR'' THEN 6.5 + n2*0.2 + severity*1.5
+            ELSE 6.0 + n2*0.2
+        END,
+        CASE
+            WHEN scenario = ''CLEAN'' THEN 10.5 + n3*0.4
+            WHEN scenario = ''MISALIGNMENT'' THEN 12.0 + n3*0.5 + severity*8.0*(1+severity)
+            WHEN scenario = ''BEARING_WEAR'' THEN 11.5 + n3*0.4 + severity*3.0
+            ELSE 10.5 + n3*0.4
+        END,
+        CASE
+            WHEN scenario = ''CLEAN'' THEN 65 + n1*2.0
+            WHEN scenario = ''BEARING_WEAR'' THEN 72 + n1*2.0 + severity*18.0 + CASE WHEN severity > 0.7 THEN ABS(n2)*8.0 ELSE 0 END
+            WHEN scenario = ''MISALIGNMENT'' THEN 70 + n1*1.5 + severity*12.0
+            WHEN scenario = ''IMBALANCE'' THEN 68 + n1*1.5 + severity*6.0
+            ELSE 65 + n1*2.0
+        END
+    FROM combined;
+
+    v_rows := (SELECT :v_readings_per_asset * (SELECT COUNT(*) FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER WHERE (:P_ASSET_ID = ''ALL'' OR asset_id = :P_ASSET_ID)));
+
+    INSERT INTO MFGPULSE_DB.RAW_IT.PRODUCTION_OUTPUT
+        (record_id, asset_id, shift_id, timestamp, units_produced, good_units, ideal_cycle_time_sec)
+    SELECT
+        ''S'' || RIGHT(asset_id, 3) || ''-'' || TO_CHAR(CURRENT_TIMESTAMP(), ''MMDDHH24MISS''),
+        asset_id,
+        ''SHIFT_SIM'',
+        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
+        CASE
+            WHEN :v_scenario = ''CLEAN'' THEN 100
+            WHEN :P_SEVERITY > 0.7 THEN GREATEST(20, 100 - FLOOR(:P_SEVERITY * 80))
+            ELSE GREATEST(50, 100 - FLOOR(:P_SEVERITY * 50))
+        END,
+        CASE
+            WHEN :v_scenario = ''CLEAN'' THEN 98
+            WHEN :P_SEVERITY > 0.7 THEN GREATEST(10, 98 - FLOOR(:P_SEVERITY * 88))
+            ELSE GREATEST(40, 98 - FLOOR(:P_SEVERITY * 58))
+        END,
+        30.0
+    FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER
+    WHERE (:P_ASSET_ID = ''ALL'' OR asset_id = :P_ASSET_ID);
+
+    RETURN ''Generated '' || :v_rows || '' sensor readings + production records for '' || :P_ASSET_ID || '' ['' || :v_scenario || '' severity='' || :P_SEVERITY || '']'';
+END;
+';
+create or replace stream SENSOR_READINGS_STREAM on table SENSOR_READINGS append_only = true;
