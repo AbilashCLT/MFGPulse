@@ -1,13 +1,14 @@
-[project]
+[tool.poetry]
 name = "failure-genome-dashboard"
 version = "1.0.0"
 description = "MFGPulse AI — Predictive Maintenance & OEE Command Center"
-requires-python = ">=3.11"
+readme = "README.md"
+package-mode = false
 
-dependencies = [
-    "streamlit[snowflake]>=1.54.0"
-]
+[tool.poetry.dependencies]
+python = "^3.11"
+streamlit = {extras = ["snowflake"], version = "^1.54.0"}
 
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
