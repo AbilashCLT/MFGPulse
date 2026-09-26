@@ -303,6 +303,241 @@ if section == "Service command center":
 elif section == "Tasks":
     _section_header("⏱", "Task monitor")
 
+    # ─── Run Full Pipeline ───────────────────────────────────────────────
+    import time as _time
+
+    # DAG topology: list of (task_name, display_label, depth_indent)
+    _DAG_TASKS_ORDERED = [
+        ("MFGPULSE_AUTOMATION_DAG",  "Simulate sensor feeds",    0),
+        ("DAG_CHECK_FRESHNESS",      "Check data freshness",     1),
+        ("DAG_REFRESH_FATIGUE",      "Refresh fatigue scores",   1),
+        ("DAG_REFRESH_DTS",          "Refresh dynamic tables",   2),
+        ("DAG_GENERATE_WOS",         "Generate work orders",     3),
+        ("DAG_GENERATE_POS",         "Generate purchase orders", 4),
+        ("DAG_CONVERT_PPOS",         "Convert planned POs",      5),
+        ("DAG_SNAPSHOT_KPIS",        "Snapshot KPIs",            6),
+        ("DAG_CHECK_DRIFT",          "Check model drift",        3),
+        ("DAG_ARCHIVE_ALERTS",       "Archive alerts",           3),
+    ]
+    _DAG_TASK_NAMES = [t[0] for t in _DAG_TASKS_ORDERED]
+    _DAG_SCHEMA = "ANALYTICS"
+
+    with st.container(border=True):
+        st.html("""
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
+            <div style="color:#00D4FF; font-size:0.7rem; text-transform:uppercase; letter-spacing:0.1em; font-weight:700;">
+                :material/rocket_launch: Run full pipeline
+            </div>
+        </div>
+        <div style="color:#94A3B8; font-size:0.72rem; margin-bottom:10px;">
+            Execute the complete automation DAG: simulate feeds &rarr; refresh fatigue &rarr;
+            refresh DTs &rarr; generate WOs &rarr; generate POs &rarr; convert PPOs &rarr; snapshot KPIs.
+            Tasks are auto-resumed before execution and suspended after completion.
+        </div>
+        """)
+
+        # Show DAG topology as a compact visual
+        dag_lines = []
+        for tname, tlabel, depth in _DAG_TASKS_ORDERED:
+            prefix = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth
+            connector = "&#9492;&#9472; " if depth > 0 else "&#9679; "
+            dag_lines.append(f'<span style="color:#64748B;">{prefix}{connector}</span>'
+                             f'<span style="color:#E0E7FF;">{tlabel}</span>'
+                             f' <span style="color:#475569; font-size:0.6rem;">({tname})</span>')
+        with st.expander("DAG topology", expanded=False, icon=":material/account_tree:"):
+            st.html(f'<div style="font-family:monospace; font-size:0.72rem; line-height:1.6;">{"<br>".join(dag_lines)}</div>')
+
+        # Pipeline execution state
+        if "pipeline_running" not in st.session_state:
+            st.session_state.pipeline_running = False
+        if "pipeline_run_id" not in st.session_state:
+            st.session_state.pipeline_run_id = None
+        if "pipeline_start_ts" not in st.session_state:
+            st.session_state.pipeline_start_ts = None
+        if "pipeline_result" not in st.session_state:
+            st.session_state.pipeline_result = None
+
+        def _resume_all_tasks():
+            """Resume child tasks bottom-up, then root."""
+            session = conn.session()
+            # Resume in reverse order (leaves first)
+            for tname in reversed(_DAG_TASK_NAMES):
+                try:
+                    session.sql(f"ALTER TASK {DB}.{_DAG_SCHEMA}.{tname} RESUME").collect()
+                except Exception:
+                    pass  # already started or doesn't exist
+
+        def _suspend_all_tasks():
+            """Suspend root first, then children top-down."""
+            session = conn.session()
+            for tname in _DAG_TASK_NAMES:
+                try:
+                    session.sql(f"ALTER TASK {DB}.{_DAG_SCHEMA}.{tname} SUSPEND").collect()
+                except Exception:
+                    pass
+
+        def _execute_root_task():
+            """Trigger the root task."""
+            session = conn.session()
+            session.sql(f"EXECUTE TASK {DB}.{_DAG_SCHEMA}.MFGPULSE_AUTOMATION_DAG").collect()
+
+        def _get_run_status(start_ts):
+            """Poll TASK_HISTORY for all DAG tasks since start_ts."""
+            try:
+                df = conn.query(f"""
+                    SELECT NAME, STATE, SCHEDULED_TIME, COMPLETED_TIME, ERROR_MESSAGE,
+                        DATEDIFF('second', SCHEDULED_TIME, COALESCE(COMPLETED_TIME, CURRENT_TIMESTAMP())) AS DURATION_S
+                    FROM TABLE({DB}.INFORMATION_SCHEMA.TASK_HISTORY(
+                        SCHEDULED_TIME_RANGE_START => '{start_ts}'::TIMESTAMP_LTZ,
+                        RESULT_LIMIT => 100
+                    ))
+                    WHERE NAME IN ({','.join(["'" + t + "'" for t in _DAG_TASK_NAMES])})
+                    ORDER BY SCHEDULED_TIME
+                """)
+                return df
+            except Exception:
+                return pd.DataFrame()
+
+        # Show previous result if exists
+        if st.session_state.pipeline_result is not None:
+            result = st.session_state.pipeline_result
+            if result["success"]:
+                st.success(f"Pipeline completed successfully in {result['duration']}s — all {result['tasks_ok']} tasks succeeded.", icon=":material/check_circle:")
+            else:
+                st.error(f"Pipeline finished with errors: {result.get('error', 'unknown')}", icon=":material/error:")
+            if st.button("Clear result", key="clear_pipeline_result", icon=":material/close:"):
+                st.session_state.pipeline_result = None
+                st.rerun()
+
+        # Run button or active polling
+        if not st.session_state.pipeline_running:
+            if st.button("Run full pipeline", type="primary", icon=":material/rocket_launch:", use_container_width=True, key="run_dag_btn"):
+                st.session_state.pipeline_running = True
+                st.session_state.pipeline_result = None
+                st.session_state.pipeline_start_ts = None
+                st.rerun()
+        else:
+            # Active pipeline execution
+            status_container = st.status("Running automation pipeline...", expanded=True, state="running")
+            with status_container:
+                session = conn.session()
+                start_ts = st.session_state.pipeline_start_ts
+
+                if start_ts is None:
+                    # Step 1: Resume all tasks
+                    st.write(":material/play_arrow: Resuming child tasks...")
+                    _resume_all_tasks()
+                    _time.sleep(1)
+
+                    # Step 2: Execute root task
+                    st.write(":material/rocket_launch: Executing root task...")
+                    try:
+                        _execute_root_task()
+                    except Exception as ex:
+                        _suspend_all_tasks()
+                        st.session_state.pipeline_running = False
+                        st.session_state.pipeline_result = {"success": False, "error": str(ex)}
+                        st.rerun()
+
+                    start_ts = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+                    st.session_state.pipeline_start_ts = start_ts
+                    st.write(f":material/schedule: Pipeline triggered at {start_ts}")
+                    _time.sleep(3)
+
+                # Step 3: Poll for status
+                st.write(":material/monitoring: Polling task execution status...")
+                history = _get_run_status(start_ts)
+
+                if len(history) > 0:
+                    # Build status display
+                    task_status = {}
+                    for _, row in history.iterrows():
+                        name = row["NAME"]
+                        # Keep the latest state per task
+                        task_status[name] = row
+
+                    # Render status table
+                    status_rows = []
+                    for tname, tlabel, depth in _DAG_TASKS_ORDERED:
+                        indent = "  " * depth
+                        if tname in task_status:
+                            r = task_status[tname]
+                            state = r["STATE"]
+                            dur = int(r["DURATION_S"]) if pd.notna(r["DURATION_S"]) else 0
+                            err = r.get("ERROR_MESSAGE", "")
+                        else:
+                            state = "PENDING"
+                            dur = 0
+                            err = ""
+                        status_rows.append({
+                            "Task": f"{indent}{tlabel}",
+                            "State": state,
+                            "Duration": f"{dur}s" if dur > 0 else "—",
+                            "Error": str(err)[:80] if err else "",
+                        })
+
+                    status_df = pd.DataFrame(status_rows)
+
+                    # Color-coded state badges
+                    for _, srow in status_df.iterrows():
+                        state = srow["State"]
+                        icon = {
+                            "SUCCEEDED": ":material/check_circle:",
+                            "EXECUTING": ":material/sync:",
+                            "FAILED": ":material/error:",
+                            "SCHEDULED": ":material/schedule:",
+                            "SKIPPED": ":material/skip_next:",
+                            "CANCELLED": ":material/cancel:",
+                        }.get(state, ":material/hourglass_empty:")
+                        color = {
+                            "SUCCEEDED": "green", "EXECUTING": "blue",
+                            "FAILED": "red", "SCHEDULED": "orange",
+                            "SKIPPED": "gray", "CANCELLED": "gray",
+                        }.get(state, "gray")
+                        err_txt = f" — {srow['Error']}" if srow["Error"] else ""
+                        st.markdown(f"{icon} **{srow['Task']}** — :{color}[{state}] {srow['Duration']}{err_txt}")
+
+                    # Check if all tasks have terminal state
+                    terminal_states = {"SUCCEEDED", "FAILED", "SKIPPED", "CANCELLED"}
+                    active_states = {"EXECUTING", "SCHEDULED"}
+                    all_states = set(task_status[t]["STATE"] for t in task_status)
+
+                    if all_states.issubset(terminal_states) and len(task_status) >= 3:
+                        # Pipeline complete
+                        _suspend_all_tasks()
+                        succeeded = sum(1 for t in task_status.values() if t["STATE"] == "SUCCEEDED")
+                        failed = sum(1 for t in task_status.values() if t["STATE"] == "FAILED")
+                        total_dur = int((pd.Timestamp.now(tz="UTC") - pd.Timestamp(start_ts, tz="UTC")).total_seconds())
+                        fail_msg = ""
+                        if failed > 0:
+                            fail_tasks = [f"{t}: {task_status[t].get('ERROR_MESSAGE', '')}" for t in task_status if task_status[t]["STATE"] == "FAILED"]
+                            fail_msg = "; ".join(fail_tasks)
+                        st.session_state.pipeline_running = False
+                        st.session_state.pipeline_result = {
+                            "success": failed == 0,
+                            "tasks_ok": succeeded,
+                            "tasks_fail": failed,
+                            "duration": total_dur,
+                            "error": fail_msg if fail_msg else None,
+                        }
+                        status_container.update(
+                            label=f"Pipeline {'completed' if failed == 0 else 'finished with errors'} — {succeeded} succeeded, {failed} failed",
+                            state="complete" if failed == 0 else "error",
+                            expanded=False,
+                        )
+                        st.rerun()
+                    else:
+                        # Still running — auto-refresh
+                        _time.sleep(5)
+                        st.rerun()
+                else:
+                    st.write(":material/hourglass_empty: Waiting for tasks to start...")
+                    _time.sleep(5)
+                    st.rerun()
+
+    st.divider()
+
+    # ─── Existing Task Cards ────────────────────────────────────────────
     tasks_df = run_show(f"SHOW TASKS IN DATABASE {DB}")
     if len(tasks_df) > 0:
         # Task state distribution chart
