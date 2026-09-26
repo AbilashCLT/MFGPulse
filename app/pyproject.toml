@@ -8,6 +8,7 @@ package-mode = false
 [tool.poetry.dependencies]
 python = "^3.11"
 streamlit = {extras = ["snowflake"], version = "^1.54.0"}
+snowflake-connector-python = "^3.12.0"  # <-- Add this line
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
