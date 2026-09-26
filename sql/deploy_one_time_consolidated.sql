@@ -570,7 +570,8 @@ FROM TABLE(GENERATOR(ROWCOUNT => 190));
 -- ============================================================================
 
 -- Creates procedure then calls it to generate 172K+ sensor readings.
--- This is the longest step (~1-2 minutes).
+-- v2: Lifecycle-shaped degradation curves with maintenance resets and burst spikes.
+-- Produces differentiated fleet: 3 HEALTHY, 4 ACCUMULATING, 3 HIGH fatigue levels.
 -- Truncate first for idempotency.
 TRUNCATE TABLE IF EXISTS RAW_OT.SENSOR_READINGS;
 CREATE OR REPLACE PROCEDURE RAW_OT.GENERATE_SENSOR_DATA()
@@ -583,7 +584,7 @@ DECLARE
     end_date DATE := ''2026-08-28'';
     row_count INTEGER := 0;
 BEGIN
-    INSERT INTO MFGPULSE_DB.RAW_OT.SENSOR_READINGS 
+    INSERT INTO MFGPULSE_DB.RAW_OT.SENSOR_READINGS
         (asset_id, timestamp, vibration_x, vibration_y, vibration_z, temperature, rpm, pressure, current_amps, acoustic_db)
     WITH time_series AS (
         SELECT DATEADD(''minute'', seq4() * 15, :start_date::TIMESTAMP_NTZ) AS ts
@@ -592,67 +593,220 @@ BEGIN
     assets AS (
         SELECT asset_id, rated_rpm, rated_temp_max,
             CASE asset_id
-                WHEN ''ASSET_001'' THEN ''bearing_wear'' WHEN ''ASSET_002'' THEN ''thermal_degradation''
-                WHEN ''ASSET_003'' THEN ''imbalance'' WHEN ''ASSET_004'' THEN ''misalignment''
-                WHEN ''ASSET_005'' THEN ''bearing_wear'' WHEN ''ASSET_006'' THEN ''thermal_degradation''
-                WHEN ''ASSET_007'' THEN ''healthy'' WHEN ''ASSET_008'' THEN ''imbalance''
-                WHEN ''ASSET_009'' THEN ''misalignment'' WHEN ''ASSET_010'' THEN ''healthy''
-            END AS failure_mode,
-            CASE asset_id
-                WHEN ''ASSET_001'' THEN 0.55 WHEN ''ASSET_002'' THEN 0.60 WHEN ''ASSET_003'' THEN 0.50
-                WHEN ''ASSET_004'' THEN 0.45 WHEN ''ASSET_005'' THEN 0.65 WHEN ''ASSET_006'' THEN 0.70
-                WHEN ''ASSET_007'' THEN 0.99 WHEN ''ASSET_008'' THEN 0.75 WHEN ''ASSET_009'' THEN 0.40
-                WHEN ''ASSET_010'' THEN 0.99
-            END AS failure_start_pct
+                WHEN ''ASSET_001'' THEN ''bearing_wear''
+                WHEN ''ASSET_002'' THEN ''thermal_degradation''
+                WHEN ''ASSET_003'' THEN ''imbalance''
+                WHEN ''ASSET_004'' THEN ''misalignment''
+                WHEN ''ASSET_005'' THEN ''bearing_wear''
+                WHEN ''ASSET_006'' THEN ''thermal_degradation''
+                WHEN ''ASSET_007'' THEN ''healthy''
+                WHEN ''ASSET_008'' THEN ''imbalance''
+                WHEN ''ASSET_009'' THEN ''misalignment''
+                WHEN ''ASSET_010'' THEN ''healthy''
+            END AS failure_mode
         FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER
     ),
     combined AS (
-        SELECT a.asset_id, t.ts, a.rated_rpm, a.rated_temp_max, a.failure_mode, a.failure_start_pct,
+        SELECT a.asset_id, t.ts, a.rated_rpm, a.rated_temp_max, a.failure_mode,
             DATEDIFF(''minute'', :start_date::TIMESTAMP_NTZ, t.ts) /
                 DATEDIFF(''minute'', :start_date::TIMESTAMP_NTZ, :end_date::TIMESTAMP_NTZ)::FLOAT AS timeline_pct,
-            GREATEST(0, (DATEDIFF(''minute'', :start_date::TIMESTAMP_NTZ, t.ts) /
-                DATEDIFF(''minute'', :start_date::TIMESTAMP_NTZ, :end_date::TIMESTAMP_NTZ)::FLOAT
-                - a.failure_start_pct) / NULLIF(1 - a.failure_start_pct, 0)
-            ) AS degradation_pct,
             UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS noise1,
             UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS noise2,
             UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS noise3,
             UNIFORM(0::FLOAT, 1::FLOAT, RANDOM()) AS missing_rnd,
+            UNIFORM(0::FLOAT, 1::FLOAT, RANDOM()) AS burst_rnd,
             SIN(DATEDIFF(''hour'', :start_date::TIMESTAMP_NTZ, t.ts) / 500.0) * 0.3 AS sensor_drift
         FROM time_series t CROSS JOIN assets a
+    ),
+    -- Piecewise degradation curves shaped by each asset''s maintenance WO history
+    lifecycle AS (
+        SELECT c.*,
+            CASE c.asset_id
+                -- ASSET_001: RECOVERING - repaired Apr 10, Jun 10, Aug 10 in-progress
+                WHEN ''ASSET_001'' THEN
+                    CASE
+                        WHEN timeline_pct < 0.22 THEN timeline_pct * 1.6
+                        WHEN timeline_pct < 0.24 THEN 0.05
+                        WHEN timeline_pct < 0.56 THEN 0.05 + (timeline_pct - 0.24) * 1.1
+                        WHEN timeline_pct < 0.58 THEN 0.08
+                        WHEN timeline_pct < 0.89 THEN 0.08 + (timeline_pct - 0.58) * 1.4
+                        ELSE GREATEST(0.03, 0.51 - (timeline_pct - 0.89) * 4.0)
+                    END
+                -- ASSET_002: MID-LIFE STEADY - preventive May 25, slow climb
+                WHEN ''ASSET_002'' THEN
+                    CASE
+                        WHEN timeline_pct < 0.47 THEN timeline_pct * 0.65
+                        WHEN timeline_pct < 0.49 THEN 0.12
+                        ELSE 0.12 + (timeline_pct - 0.49) * 0.50
+                    END
+                -- ASSET_003: FRESHLY MAINTAINED - corrective Apr 15, seal May 10
+                WHEN ''ASSET_003'' THEN
+                    CASE
+                        WHEN timeline_pct < 0.25 THEN timeline_pct * 1.4
+                        WHEN timeline_pct < 0.27 THEN 0.05
+                        WHEN timeline_pct < 0.39 THEN 0.05 + (timeline_pct - 0.27) * 1.0
+                        WHEN timeline_pct < 0.41 THEN 0.03
+                        ELSE 0.03 + (timeline_pct - 0.41) * 0.10
+                    END
+                -- ASSET_004: AGING - emergency Jun 01, preventive Jun 20, coupling cracking
+                WHEN ''ASSET_004'' THEN
+                    CASE
+                        WHEN timeline_pct < 0.51 THEN timeline_pct * 0.80
+                        WHEN timeline_pct < 0.53 THEN 0.15
+                        WHEN timeline_pct < 0.62 THEN 0.15 + (timeline_pct - 0.53) * 1.5
+                        WHEN timeline_pct < 0.64 THEN 0.18
+                        ELSE 0.18 + (timeline_pct - 0.64) * 1.6
+                    END
+                -- ASSET_005: DEGRADING - emergency May 08, corrective Jul 01, not resolved
+                WHEN ''ASSET_005'' THEN
+                    CASE
+                        WHEN timeline_pct < 0.38 THEN timeline_pct * 1.5
+                        WHEN timeline_pct < 0.40 THEN 0.25
+                        WHEN timeline_pct < 0.67 THEN 0.25 + (timeline_pct - 0.40) * 1.8
+                        WHEN timeline_pct < 0.69 THEN 0.35
+                        ELSE 0.35 + (timeline_pct - 0.69) * 2.0
+                    END
+                -- ASSET_006: CRITICAL - corrective May 01, preventive Jun 05, insulation failing
+                WHEN ''ASSET_006'' THEN
+                    CASE
+                        WHEN timeline_pct < 0.34 THEN timeline_pct * 1.2
+                        WHEN timeline_pct < 0.36 THEN 0.15
+                        WHEN timeline_pct < 0.53 THEN 0.15 + (timeline_pct - 0.36) * 1.0
+                        WHEN timeline_pct < 0.55 THEN 0.18
+                        WHEN timeline_pct < 0.94 THEN 0.18 + POWER((timeline_pct - 0.55) / 0.39, 1.8) * 0.70
+                        ELSE 0.88 + (timeline_pct - 0.94) * 2.0
+                    END
+                -- ASSET_007: YOUNG ASSET - installed 2023, minimal wear
+                WHEN ''ASSET_007'' THEN
+                    0.02 + timeline_pct * 0.05 + SIN(timeline_pct * 6.28) * 0.01
+                -- ASSET_008: WATCH LIST - corrective Jun 15, preventive Jul 15, plateau
+                WHEN ''ASSET_008'' THEN
+                    CASE
+                        WHEN timeline_pct < 0.59 THEN timeline_pct * 0.90
+                        WHEN timeline_pct < 0.61 THEN 0.22
+                        WHEN timeline_pct < 0.75 THEN 0.22 + (timeline_pct - 0.61) * 0.60
+                        WHEN timeline_pct < 0.77 THEN 0.25
+                        ELSE 0.25 + (timeline_pct - 0.77) * 0.55
+                    END
+                -- ASSET_009: RECURRING ISSUE - corrective May 20, preventive Jul 05, sawtooth
+                WHEN ''ASSET_009'' THEN
+                    CASE
+                        WHEN timeline_pct < 0.44 THEN timeline_pct * 1.3
+                        WHEN timeline_pct < 0.46 THEN 0.12
+                        WHEN timeline_pct < 0.69 THEN 0.12 + (timeline_pct - 0.46) * 2.0
+                        WHEN timeline_pct < 0.71 THEN 0.18
+                        ELSE 0.18 + (timeline_pct - 0.71) * 2.2
+                    END
+                -- ASSET_010: MATURE STABLE - preventive Apr 15, very slow climb
+                WHEN ''ASSET_010'' THEN
+                    CASE
+                        WHEN timeline_pct < 0.25 THEN 0.10 + timeline_pct * 0.40
+                        WHEN timeline_pct < 0.27 THEN 0.08
+                        ELSE 0.08 + (timeline_pct - 0.27) * 0.25
+                    END
+                ELSE 0.0
+            END AS degradation_pct_raw
+        FROM combined c
+    ),
+    shaped AS (
+        SELECT l.*,
+            LEAST(1.0, GREATEST(0.0, degradation_pct_raw)) AS degradation_pct,
+            CASE
+                WHEN degradation_pct_raw < 0.15 THEN 1.0
+                WHEN degradation_pct_raw < 0.35 THEN 1.3
+                WHEN degradation_pct_raw < 0.60 THEN 1.6
+                WHEN degradation_pct_raw < 0.80 THEN 2.0
+                ELSE 2.5
+            END AS noise_scale,
+            -- Intermittent burst spike: rare large spikes drive crest factor up
+            CASE
+                WHEN degradation_pct_raw > 0.70 AND burst_rnd > 0.85 THEN degradation_pct_raw * 12.0
+                WHEN degradation_pct_raw > 0.50 AND burst_rnd > 0.90 THEN degradation_pct_raw * 8.0
+                WHEN degradation_pct_raw > 0.30 AND burst_rnd > 0.95 THEN degradation_pct_raw * 4.0
+                ELSE 0.0
+            END AS burst_spike
+        FROM lifecycle l
     )
     SELECT asset_id, ts,
         CASE WHEN missing_rnd < 0.002 THEN NULL
-            WHEN failure_mode = ''bearing_wear'' THEN 2.0 + noise1*0.5 + sensor_drift + degradation_pct*8.0*(1+degradation_pct) + CASE WHEN degradation_pct > 0.8 THEN ABS(noise2)*15.0 ELSE 0 END
-            WHEN failure_mode = ''misalignment'' THEN 2.5 + noise1*0.4 + sensor_drift + degradation_pct*5.0 + degradation_pct*SIN(timeline_pct*200)*3.0
-            WHEN failure_mode = ''imbalance'' THEN 1.8 + noise1*0.3 + sensor_drift + degradation_pct*2.0
-            ELSE 1.5 + noise1*0.4 + sensor_drift END,
+            WHEN failure_mode = ''bearing_wear'' THEN
+                2.0 + noise1*0.5*noise_scale + sensor_drift + degradation_pct*8.0*(1 + degradation_pct)
+                + burst_spike * (1.0 + ABS(noise2)) + CASE WHEN degradation_pct > 0.8 THEN ABS(noise2)*15.0 ELSE 0 END
+            WHEN failure_mode = ''misalignment'' THEN
+                2.5 + noise1*0.4*noise_scale + sensor_drift + degradation_pct*5.0
+                + degradation_pct*SIN(timeline_pct*200)*3.0 + burst_spike * 0.8
+            WHEN failure_mode = ''imbalance'' THEN
+                1.8 + noise1*0.3*noise_scale + sensor_drift + degradation_pct*4.0*(1 + degradation_pct*0.5) + burst_spike * 0.6
+            WHEN failure_mode = ''thermal_degradation'' THEN
+                1.6 + noise1*0.3*noise_scale + sensor_drift + degradation_pct*1.5 + burst_spike * 0.3
+            ELSE 1.5 + noise1*0.4 + sensor_drift
+        END,
         CASE WHEN missing_rnd < 0.002 THEN NULL
-            WHEN failure_mode = ''bearing_wear'' THEN 1.8 + noise2*0.4 + degradation_pct*6.0*(1+degradation_pct*0.5)
-            WHEN failure_mode = ''misalignment'' THEN 2.2 + noise2*0.5 + degradation_pct*6.5 + degradation_pct*COS(timeline_pct*200)*2.5
-            WHEN failure_mode = ''imbalance'' THEN 1.5 + noise2*0.3 + degradation_pct*7.0*(1+degradation_pct)
-            ELSE 1.3 + noise2*0.35 END,
+            WHEN failure_mode = ''bearing_wear'' THEN
+                1.8 + noise2*0.4*noise_scale + degradation_pct*6.0*(1 + degradation_pct*0.5) + burst_spike * (0.8 + ABS(noise1)*0.5)
+            WHEN failure_mode = ''misalignment'' THEN
+                2.2 + noise2*0.5*noise_scale + degradation_pct*6.5 + degradation_pct*COS(timeline_pct*200)*2.5 + burst_spike * 0.9
+            WHEN failure_mode = ''imbalance'' THEN
+                1.5 + noise2*0.3*noise_scale + degradation_pct*7.0*(1 + degradation_pct) + burst_spike * 0.7
+            WHEN failure_mode = ''thermal_degradation'' THEN
+                1.4 + noise2*0.3*noise_scale + degradation_pct*1.2
+            ELSE 1.3 + noise2*0.35
+        END,
         CASE WHEN missing_rnd < 0.002 THEN NULL
-            WHEN failure_mode = ''bearing_wear'' THEN 1.5 + noise3*0.3 + degradation_pct*4.0
-            WHEN failure_mode = ''misalignment'' THEN 2.0 + noise3*0.5 + degradation_pct*5.5
-            WHEN failure_mode = ''imbalance'' THEN 1.2 + noise3*0.25 + degradation_pct*1.5
-            ELSE 1.1 + noise3*0.3 END,
+            WHEN failure_mode = ''bearing_wear'' THEN
+                1.5 + noise3*0.3*noise_scale + degradation_pct*4.0 + burst_spike * 0.5
+            WHEN failure_mode = ''misalignment'' THEN
+                2.0 + noise3*0.5*noise_scale + degradation_pct*5.5 + burst_spike * 0.7
+            WHEN failure_mode = ''imbalance'' THEN
+                1.2 + noise3*0.25*noise_scale + degradation_pct*3.5*(1 + degradation_pct*0.3) + burst_spike * 0.4
+            WHEN failure_mode = ''thermal_degradation'' THEN
+                1.2 + noise3*0.25*noise_scale + degradation_pct*0.8
+            ELSE 1.1 + noise3*0.3
+        END,
         CASE WHEN missing_rnd < 0.001 THEN NULL
-            WHEN failure_mode = ''thermal_degradation'' THEN rated_temp_max*0.55 + noise1*2.0 + degradation_pct*rated_temp_max*0.40*(1+degradation_pct*0.3) + SIN(timeline_pct*48)*3.0
-            WHEN failure_mode = ''bearing_wear'' THEN rated_temp_max*0.50 + noise1*1.5 + degradation_pct*rated_temp_max*0.15
-            ELSE rated_temp_max*0.50 + noise1*2.0 + SIN(timeline_pct*48)*2.5 END,
-        CASE WHEN failure_mode = ''imbalance'' THEN rated_rpm*(1.0 + noise1*0.005 - degradation_pct*0.08)
-            ELSE rated_rpm*(1.0 + noise1*0.003) END,
-        CASE WHEN failure_mode = ''bearing_wear'' THEN 6.5+noise2*0.2+degradation_pct*1.5 ELSE 6.0+noise2*0.2 END,
-        CASE WHEN failure_mode = ''misalignment'' THEN 12.0 + noise3*0.5 + degradation_pct*8.0*(1+degradation_pct)
-            WHEN failure_mode = ''bearing_wear'' THEN 11.5 + noise3*0.4 + degradation_pct*3.0
-            ELSE 10.5 + noise3*0.4 END,
-        CASE WHEN failure_mode = ''bearing_wear'' THEN 72 + noise1*2.0 + degradation_pct*18.0 + CASE WHEN degradation_pct > 0.7 THEN ABS(noise2)*8.0 ELSE 0 END
-            WHEN failure_mode = ''misalignment'' THEN 70 + noise1*1.5 + degradation_pct*12.0
-            ELSE 65 + noise1*2.0 END
-    FROM combined WHERE missing_rnd > 0.003;
+            WHEN failure_mode = ''thermal_degradation'' THEN
+                rated_temp_max*0.55 + noise1*2.0*noise_scale + degradation_pct*rated_temp_max*0.40*(1 + degradation_pct*0.3) + SIN(timeline_pct*48)*3.0
+            WHEN failure_mode = ''bearing_wear'' THEN
+                rated_temp_max*0.50 + noise1*1.5 + degradation_pct*rated_temp_max*0.20
+                + CASE WHEN degradation_pct > 0.7 THEN degradation_pct*rated_temp_max*0.08 ELSE 0 END
+            WHEN failure_mode = ''misalignment'' THEN
+                rated_temp_max*0.52 + noise1*1.5 + degradation_pct*rated_temp_max*0.10
+            ELSE rated_temp_max*0.50 + noise1*2.0 + SIN(timeline_pct*48)*2.5
+        END,
+        CASE
+            WHEN failure_mode = ''imbalance'' THEN rated_rpm*(1.0 + noise1*0.005 - degradation_pct*0.08)
+            WHEN failure_mode = ''bearing_wear'' AND degradation_pct > 0.6 THEN rated_rpm*(1.0 + noise1*0.003 - degradation_pct*0.02)
+            ELSE rated_rpm*(1.0 + noise1*0.003)
+        END,
+        CASE
+            WHEN failure_mode = ''bearing_wear'' THEN 6.5 + noise2*0.2 + degradation_pct*1.5
+            WHEN failure_mode = ''misalignment'' AND degradation_pct > 0.5 THEN 6.2 + noise2*0.3 + degradation_pct*0.8
+            ELSE 6.0 + noise2*0.2
+        END,
+        CASE
+            WHEN failure_mode = ''misalignment'' THEN
+                12.0 + noise3*0.5*noise_scale + degradation_pct*8.0*(1 + degradation_pct)
+            WHEN failure_mode = ''bearing_wear'' THEN
+                11.5 + noise3*0.4 + degradation_pct*3.0 + CASE WHEN degradation_pct > 0.7 THEN degradation_pct*2.5 ELSE 0 END
+            WHEN failure_mode = ''imbalance'' THEN
+                11.0 + noise3*0.4 + degradation_pct*2.0
+            ELSE 10.5 + noise3*0.4
+        END,
+        CASE
+            WHEN failure_mode = ''bearing_wear'' THEN
+                72 + noise1*2.0*noise_scale + degradation_pct*18.0 + burst_spike * 2.0
+                + CASE WHEN degradation_pct > 0.7 THEN ABS(noise2)*8.0 ELSE 0 END
+            WHEN failure_mode = ''misalignment'' THEN
+                70 + noise1*1.5*noise_scale + degradation_pct*12.0 + burst_spike * 1.5
+            WHEN failure_mode = ''imbalance'' THEN
+                68 + noise1*1.5 + degradation_pct*8.0
+            WHEN failure_mode = ''thermal_degradation'' THEN
+                66 + noise1*2.0 + degradation_pct*20.0 + CASE WHEN degradation_pct > 0.5 THEN degradation_pct*10.0 ELSE 0 END
+            ELSE 65 + noise1*2.0
+        END
+    FROM shaped WHERE missing_rnd > 0.003;
     SELECT COUNT(*) INTO :row_count FROM MFGPULSE_DB.RAW_OT.SENSOR_READINGS;
-    RETURN ''Generated '' || :row_count || '' sensor readings'';
+    RETURN ''Generated '' || :row_count || '' sensor readings (lifecycle-shaped v2)'';
 END;
 ';
 
@@ -5408,7 +5562,7 @@ CREATE TABLE IF NOT EXISTS RAW_IT.SIMULATION_CONFIG (
     COMPLETED_AT TIMESTAMP_NTZ
 );
 
--- 2. Configurable sensor feed procedure
+-- 2. Configurable sensor feed procedure (v2 — added LIFECYCLE scenario)
 CREATE OR REPLACE PROCEDURE RAW_OT.SIMULATE_SENSOR_FEED_CONFIGURABLE(
     P_ASSET_ID VARCHAR,
     P_SCENARIO VARCHAR,
@@ -5428,7 +5582,6 @@ BEGIN
     v_readings_per_asset := :P_HOURS * 4;
     v_scenario := UPPER(:P_SCENARIO);
 
-    -- Generate sensor readings
     INSERT INTO MFGPULSE_DB.RAW_OT.SENSOR_READINGS
         (asset_id, timestamp, vibration_x, vibration_y, vibration_z, temperature, rpm, pressure, current_amps, acoustic_db)
     WITH time_slots AS (
@@ -5440,85 +5593,118 @@ BEGIN
         FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER
         WHERE (:P_ASSET_ID = 'ALL' OR asset_id = :P_ASSET_ID)
     ),
+    latest_state AS (
+        SELECT asset_id,
+            degradation_score AS current_deg,
+            fatigue_score AS current_fat,
+            CASE stage_pred
+                WHEN 'Critical' THEN 0.85
+                WHEN 'Warning'  THEN 0.50
+                ELSE 0.15
+            END AS base_severity
+        FROM MFGPULSE_DB.ML_MODELS.LIVE_PREDICTIONS
+    ),
     combined AS (
         SELECT a.asset_id, t.ts, a.rated_rpm, a.rated_temp_max,
             :v_scenario AS scenario,
-            :P_SEVERITY AS severity,
+            CASE
+                WHEN :v_scenario = 'LIFECYCLE' THEN COALESCE(ls.base_severity, 0.15)
+                ELSE :P_SEVERITY
+            END AS severity,
+            CASE
+                WHEN :v_scenario = 'LIFECYCLE' THEN
+                    CASE a.asset_id
+                        WHEN 'ASSET_001' THEN 'BEARING_WEAR'
+                        WHEN 'ASSET_002' THEN 'THERMAL_DEGRADATION'
+                        WHEN 'ASSET_003' THEN 'CLEAN'
+                        WHEN 'ASSET_004' THEN 'MISALIGNMENT'
+                        WHEN 'ASSET_005' THEN 'BEARING_WEAR'
+                        WHEN 'ASSET_006' THEN 'THERMAL_DEGRADATION'
+                        WHEN 'ASSET_007' THEN 'CLEAN'
+                        WHEN 'ASSET_008' THEN 'IMBALANCE'
+                        WHEN 'ASSET_009' THEN 'MISALIGNMENT'
+                        WHEN 'ASSET_010' THEN 'CLEAN'
+                        ELSE 'CLEAN'
+                    END
+                ELSE :v_scenario
+            END AS effective_scenario,
             ROW_NUMBER() OVER (PARTITION BY a.asset_id ORDER BY t.ts) / :v_readings_per_asset::FLOAT AS timeline_pct,
             UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS n1,
             UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS n2,
             UNIFORM(-1::FLOAT, 1::FLOAT, RANDOM()) AS n3,
-            UNIFORM(0::FLOAT, 1::FLOAT, RANDOM()) AS n4
-        FROM time_slots t CROSS JOIN target_assets a
+            UNIFORM(0::FLOAT, 1::FLOAT, RANDOM()) AS n4,
+            CASE
+                WHEN COALESCE(ls.base_severity, :P_SEVERITY) < 0.2 THEN 1.0
+                WHEN COALESCE(ls.base_severity, :P_SEVERITY) < 0.4 THEN 1.4
+                WHEN COALESCE(ls.base_severity, :P_SEVERITY) < 0.7 THEN 2.2
+                ELSE 3.5
+            END AS noise_scale
+        FROM time_slots t
+        CROSS JOIN target_assets a
+        LEFT JOIN latest_state ls ON a.asset_id = ls.asset_id
     )
     SELECT
         asset_id, ts,
-        -- vibration_x
         CASE
-            WHEN scenario = 'CLEAN' THEN 1.5 + n1*0.3
-            WHEN scenario = 'BEARING_WEAR' THEN 2.0 + n1*0.5 + severity*8.0*(1+severity) + CASE WHEN severity > 0.8 THEN ABS(n2)*15.0 ELSE 0 END
-            WHEN scenario = 'MISALIGNMENT' THEN 2.5 + n1*0.4 + severity*5.0 + severity*SIN(timeline_pct*200)*3.0
-            WHEN scenario = 'IMBALANCE' THEN 1.8 + n1*0.3 + severity*2.0
-            WHEN scenario = 'THERMAL_DEGRADATION' THEN 1.6 + n1*0.3 + severity*0.5
+            WHEN effective_scenario = 'CLEAN' THEN 1.5 + n1*0.3
+            WHEN effective_scenario = 'BEARING_WEAR' THEN 2.0 + n1*0.5*noise_scale + severity*8.0*(1+severity) + CASE WHEN severity > 0.8 THEN ABS(n2)*15.0 ELSE 0 END
+            WHEN effective_scenario = 'MISALIGNMENT' THEN 2.5 + n1*0.4*noise_scale + severity*5.0 + severity*SIN(timeline_pct*200)*3.0
+            WHEN effective_scenario = 'IMBALANCE' THEN 1.8 + n1*0.3*noise_scale + severity*4.0*(1+severity*0.5)
+            WHEN effective_scenario = 'THERMAL_DEGRADATION' THEN 1.6 + n1*0.3*noise_scale + severity*1.5
             ELSE 1.5 + n1*0.3
         END,
-        -- vibration_y
         CASE
-            WHEN scenario = 'CLEAN' THEN 1.3 + n2*0.3
-            WHEN scenario = 'BEARING_WEAR' THEN 1.8 + n2*0.4 + severity*6.0*(1+severity*0.5)
-            WHEN scenario = 'MISALIGNMENT' THEN 2.2 + n2*0.5 + severity*6.5 + severity*COS(timeline_pct*200)*2.5
-            WHEN scenario = 'IMBALANCE' THEN 1.5 + n2*0.3 + severity*7.0*(1+severity)
-            WHEN scenario = 'THERMAL_DEGRADATION' THEN 1.4 + n2*0.3 + severity*0.4
+            WHEN effective_scenario = 'CLEAN' THEN 1.3 + n2*0.3
+            WHEN effective_scenario = 'BEARING_WEAR' THEN 1.8 + n2*0.4*noise_scale + severity*6.0*(1+severity*0.5)
+            WHEN effective_scenario = 'MISALIGNMENT' THEN 2.2 + n2*0.5*noise_scale + severity*6.5 + severity*COS(timeline_pct*200)*2.5
+            WHEN effective_scenario = 'IMBALANCE' THEN 1.5 + n2*0.3*noise_scale + severity*7.0*(1+severity)
+            WHEN effective_scenario = 'THERMAL_DEGRADATION' THEN 1.4 + n2*0.3*noise_scale + severity*1.2
             ELSE 1.3 + n2*0.3
         END,
-        -- vibration_z
         CASE
-            WHEN scenario = 'CLEAN' THEN 1.1 + n3*0.25
-            WHEN scenario = 'BEARING_WEAR' THEN 1.5 + n3*0.3 + severity*4.0
-            WHEN scenario = 'MISALIGNMENT' THEN 2.0 + n3*0.5 + severity*5.5
-            WHEN scenario = 'IMBALANCE' THEN 1.2 + n3*0.25 + severity*1.5
-            WHEN scenario = 'THERMAL_DEGRADATION' THEN 1.2 + n3*0.25 + severity*0.3
+            WHEN effective_scenario = 'CLEAN' THEN 1.1 + n3*0.25
+            WHEN effective_scenario = 'BEARING_WEAR' THEN 1.5 + n3*0.3*noise_scale + severity*4.0
+            WHEN effective_scenario = 'MISALIGNMENT' THEN 2.0 + n3*0.5*noise_scale + severity*5.5
+            WHEN effective_scenario = 'IMBALANCE' THEN 1.2 + n3*0.25*noise_scale + severity*3.5*(1+severity*0.3)
+            WHEN effective_scenario = 'THERMAL_DEGRADATION' THEN 1.2 + n3*0.25*noise_scale + severity*0.8
             ELSE 1.1 + n3*0.25
         END,
-        -- temperature
         CASE
-            WHEN scenario = 'CLEAN' THEN rated_temp_max*0.50 + n1*2.0
-            WHEN scenario = 'THERMAL_DEGRADATION' THEN rated_temp_max*0.55 + n1*2.0 + severity*rated_temp_max*0.40*(1+severity*0.3) + SIN(timeline_pct*48)*3.0
-            WHEN scenario = 'BEARING_WEAR' THEN rated_temp_max*0.50 + n1*1.5 + severity*rated_temp_max*0.15
-            WHEN scenario = 'MISALIGNMENT' THEN rated_temp_max*0.52 + n1*1.5 + severity*rated_temp_max*0.08
+            WHEN effective_scenario = 'CLEAN' THEN rated_temp_max*0.50 + n1*2.0
+            WHEN effective_scenario = 'THERMAL_DEGRADATION' THEN rated_temp_max*0.55 + n1*2.0*noise_scale + severity*rated_temp_max*0.40*(1+severity*0.3) + SIN(timeline_pct*48)*3.0
+            WHEN effective_scenario = 'BEARING_WEAR' THEN rated_temp_max*0.50 + n1*1.5 + severity*rated_temp_max*0.20
+            WHEN effective_scenario = 'MISALIGNMENT' THEN rated_temp_max*0.52 + n1*1.5 + severity*rated_temp_max*0.10
             ELSE rated_temp_max*0.50 + n1*2.0
         END,
-        -- rpm
         CASE
-            WHEN scenario = 'IMBALANCE' THEN rated_rpm*(1.0 + n1*0.005 - severity*0.08)
+            WHEN effective_scenario = 'IMBALANCE' THEN rated_rpm*(1.0 + n1*0.005 - severity*0.08)
+            WHEN effective_scenario = 'BEARING_WEAR' AND severity > 0.6 THEN rated_rpm*(1.0 + n1*0.003 - severity*0.02)
             ELSE rated_rpm*(1.0 + n1*0.003)
         END,
-        -- pressure
         CASE
-            WHEN scenario = 'BEARING_WEAR' THEN 6.5 + n2*0.2 + severity*1.5
+            WHEN effective_scenario = 'BEARING_WEAR' THEN 6.5 + n2*0.2 + severity*1.5
+            WHEN effective_scenario = 'MISALIGNMENT' AND severity > 0.5 THEN 6.2 + n2*0.3 + severity*0.8
             ELSE 6.0 + n2*0.2
         END,
-        -- current_amps
         CASE
-            WHEN scenario = 'CLEAN' THEN 10.5 + n3*0.4
-            WHEN scenario = 'MISALIGNMENT' THEN 12.0 + n3*0.5 + severity*8.0*(1+severity)
-            WHEN scenario = 'BEARING_WEAR' THEN 11.5 + n3*0.4 + severity*3.0
+            WHEN effective_scenario = 'CLEAN' THEN 10.5 + n3*0.4
+            WHEN effective_scenario = 'MISALIGNMENT' THEN 12.0 + n3*0.5*noise_scale + severity*8.0*(1+severity)
+            WHEN effective_scenario = 'BEARING_WEAR' THEN 11.5 + n3*0.4 + severity*3.0 + CASE WHEN severity > 0.7 THEN severity*2.5 ELSE 0 END
+            WHEN effective_scenario = 'IMBALANCE' THEN 11.0 + n3*0.4 + severity*2.0
             ELSE 10.5 + n3*0.4
         END,
-        -- acoustic_db
         CASE
-            WHEN scenario = 'CLEAN' THEN 65 + n1*2.0
-            WHEN scenario = 'BEARING_WEAR' THEN 72 + n1*2.0 + severity*18.0 + CASE WHEN severity > 0.7 THEN ABS(n2)*8.0 ELSE 0 END
-            WHEN scenario = 'MISALIGNMENT' THEN 70 + n1*1.5 + severity*12.0
-            WHEN scenario = 'IMBALANCE' THEN 68 + n1*1.5 + severity*6.0
+            WHEN effective_scenario = 'CLEAN' THEN 65 + n1*2.0
+            WHEN effective_scenario = 'BEARING_WEAR' THEN 72 + n1*2.0*noise_scale + severity*18.0 + CASE WHEN severity > 0.7 THEN ABS(n2)*8.0 ELSE 0 END
+            WHEN effective_scenario = 'MISALIGNMENT' THEN 70 + n1*1.5*noise_scale + severity*12.0
+            WHEN effective_scenario = 'IMBALANCE' THEN 68 + n1*1.5 + severity*8.0
+            WHEN effective_scenario = 'THERMAL_DEGRADATION' THEN 66 + n1*2.0 + severity*15.0 + CASE WHEN severity > 0.5 THEN severity*8.0 ELSE 0 END
             ELSE 65 + n1*2.0
         END
     FROM combined;
 
-    -- Count inserted sensor rows
     v_rows := (SELECT :v_readings_per_asset * (SELECT COUNT(*) FROM MFGPULSE_DB.RAW_OT.ASSET_MASTER WHERE (:P_ASSET_ID = 'ALL' OR asset_id = :P_ASSET_ID)));
 
-    -- Generate matching production output records
     INSERT INTO MFGPULSE_DB.RAW_IT.PRODUCTION_OUTPUT
         (record_id, asset_id, shift_id, timestamp, units_produced, good_units, ideal_cycle_time_sec)
     SELECT
@@ -5527,12 +5713,24 @@ BEGIN
         'SHIFT_SIM',
         CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
         CASE
-            WHEN :v_scenario = 'CLEAN' THEN 100
+            WHEN :v_scenario = 'CLEAN' THEN 150
+            WHEN :v_scenario = 'LIFECYCLE' THEN
+                CASE asset_id
+                    WHEN 'ASSET_006' THEN 60   WHEN 'ASSET_005' THEN 80
+                    WHEN 'ASSET_009' THEN 90   WHEN 'ASSET_004' THEN 100
+                    WHEN 'ASSET_008' THEN 120  ELSE 150
+                END
             WHEN :P_SEVERITY > 0.7 THEN GREATEST(20, 100 - FLOOR(:P_SEVERITY * 80))
             ELSE GREATEST(50, 100 - FLOOR(:P_SEVERITY * 50))
         END,
         CASE
-            WHEN :v_scenario = 'CLEAN' THEN 98
+            WHEN :v_scenario = 'CLEAN' THEN 148
+            WHEN :v_scenario = 'LIFECYCLE' THEN
+                CASE asset_id
+                    WHEN 'ASSET_006' THEN 42   WHEN 'ASSET_005' THEN 64
+                    WHEN 'ASSET_009' THEN 78   WHEN 'ASSET_004' THEN 90
+                    WHEN 'ASSET_008' THEN 114  ELSE 148
+                END
             WHEN :P_SEVERITY > 0.7 THEN GREATEST(10, 98 - FLOOR(:P_SEVERITY * 88))
             ELSE GREATEST(40, 98 - FLOOR(:P_SEVERITY * 58))
         END,
@@ -6000,8 +6198,27 @@ UNION ALL SELECT 'MODEL_REGISTRY', COUNT(*), CASE WHEN COUNT(*)=12 THEN 'PASS' E
 SELECT MIN(rul_hours) AS MIN_RUL, MAX(rul_hours) AS MAX_RUL,
     MIN(degradation_score) AS MIN_DEG, MAX(degradation_score) AS MAX_DEG,
     MIN(fatigue_score) AS MIN_FAT, MAX(fatigue_score) AS MAX_FAT,
-    CASE WHEN MIN(rul_hours)>=0 AND MAX(degradation_score)<=1 AND MAX(fatigue_score)<=1 THEN 'PASS' ELSE 'FAIL' END AS STATUS
+    CASE WHEN MIN(rul_hours)>=0 AND MAX(degradation_score)<=1 AND MAX(fatigue_score)<=1 THEN 'PASS' ELSE 'FAIL' END AS RANGE_STATUS
 FROM ML_MODELS.LIVE_PREDICTIONS;
+
+-- 12f2. Fatigue level differentiation (validates lifecycle spread)
+SELECT
+    COUNT(DISTINCT fatigue_level) AS DISTINCT_LEVELS,
+    MIN(fatigue_score) AS MIN_FAT,
+    MAX(fatigue_score) AS MAX_FAT,
+    MAX(fatigue_score) - MIN(fatigue_score) AS FAT_SPREAD,
+    CASE
+        WHEN COUNT(DISTINCT fatigue_level) >= 3 AND (MAX(fatigue_score) - MIN(fatigue_score)) > 0.40
+        THEN 'PASS' ELSE 'FAIL — insufficient fleet differentiation'
+    END AS LIFECYCLE_STATUS
+FROM ML_MODELS.LIVE_PREDICTIONS;
+
+-- 12f3. Per-level asset counts (validates realistic distribution)
+SELECT fatigue_level, stage_pred, COUNT(*) AS asset_count,
+    LISTAGG(asset_id, ', ') WITHIN GROUP (ORDER BY asset_id) AS assets
+FROM ML_MODELS.LIVE_PREDICTIONS
+GROUP BY fatigue_level, stage_pred
+ORDER BY MIN(fatigue_score);
 
 -- 12g. Analytics layer
 SELECT 'ACTIVE_ALERTS' AS OBJ, COUNT(*) AS CNT, CASE WHEN COUNT(*)>0 THEN 'PASS' ELSE 'WARN' END AS STATUS FROM ANALYTICS.ACTIVE_ALERTS
