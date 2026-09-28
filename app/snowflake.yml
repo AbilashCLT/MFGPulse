@@ -29,3 +29,5 @@ entities:
     sharing:
       - role: ACCOUNTADMIN
         with_grant_option: true
+      - role: PUBLIC
+        with_grant_option: false
