@@ -244,11 +244,4 @@ MFGPulse/                                 # Workspace root
 
 ## Documentation
 
-| Document | Audience | Content |
-|---|---|---|
-| **[TECHNICAL_GUIDE.md](1%20-%20docs/TECHNICAL_GUIDE.md)** | Developers, DBAs | Architecture, data model, ML pipeline, dynamic table chain, notification system, security model |
-| **[USER_GUIDE.md](1%20-%20docs/USER_GUIDE.md)** | End users, operators | Per-persona page walkthroughs, workflow guides, FAQ, tips |
-| **[PROCESS_FLOW.md](1%20-%20docs/PROCESS_FLOW.md)** | Engineers, architects | 12 end-to-end process flow diagrams: data ingestion, feature engineering, prediction, alerts, WO/PO lifecycle, notifications, drift detection, shift handover, digital twin, copilot, DAG automation |
-| **[DEPLOYMENT_GUIDE.md](0%20-%20Setup/DEPLOYMENT_GUIDE.md)** | DevOps, DBAs | Full deployment walkthrough, prerequisites, verification, cross-instance replication, teardown |
-
----
+Refer docs for all relevant documentation including Architecture diagram, User Guide, Technical Guide etc..
